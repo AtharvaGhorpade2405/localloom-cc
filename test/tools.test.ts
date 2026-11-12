@@ -1,0 +1,137 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { loadConfig } from '../src/config.js';
+import { ApprovalPolicy, executeTool, TOOLS, toolSpecs, type ToolContext } from '../src/tools/registry.js';
+import { Workspace } from '../src/tools/workspace.js';
+import { tmpDir } from './helpers.js';
+
+const ALL = TOOLS.map((t) => t.name);
+
+function ctx(root: string, approval: 'yes' | 'no' | 'always' = 'yes'): ToolContext & { asked: ReturnType<typeof vi.fn> } {
+  const asked = vi.fn(async () => approval);
+  return {
+    workspace: new Workspace(root),
+    config: loadConfig(),
+    policy: new ApprovalPolicy(false),
+    requestApproval: asked,
+    asked,
+  };
+}
+
+describe('tools', () => {
+  it('writes, reads, edits and lists files', async () => {
+    const root = tmpDir();
+    const c = ctx(root);
+    const w = await executeTool('write_file', { path: 'src/hello.js', content: 'const a = 1;\nconsole.log(a);\n' }, c, ALL);
+    expect(w.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'src/hello.js'), 'utf8')).toContain('const a = 1;');
+
+    const r = await executeTool('read_file', { path: 'src/hello.js' }, c, ALL);
+    expect(r.ok).toBe(true);
+    expect(r.output).toMatch(/1│ const a = 1;/);
+
+    const e = await executeTool('edit_file', { path: 'src/hello.js', old_string: 'const a = 1;', new_string: 'const a = 2;' }, c, ALL);
+    expect(e.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'src/hello.js'), 'utf8')).toContain('const a = 2;');
+
+    const l = await executeTool('list_dir', { path: '.' }, c, ALL);
+    expect(l.output).toContain('src/');
+    expect(l.output).toContain('hello.js');
+
+    expect(c.workspace.changedFiles()).toEqual([{ path: 'src/hello.js', status: 'created' }]);
+  });
+
+  it('accepts common argument aliases from small models', async () => {
+    const root = tmpDir();
+    const c = ctx(root);
+    const w = await executeTool('create_file', { file_path: 'x.txt', contents: 'hi' }, c, ALL);
+    expect(w.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'x.txt'), 'utf8')).toBe('hi');
+  });
+
+  it('reports helpful errors', async () => {
+    const root = tmpDir();
+    const c = ctx(root);
+    fs.writeFileSync(path.join(root, 'a.txt'), 'x\nx\n');
+    expect((await executeTool('read_file', { path: 'missing.txt' }, c, ALL)).output).toMatch(/not found/);
+    expect((await executeTool('edit_file', { path: 'a.txt', old_string: 'zzz', new_string: 'y' }, c, ALL)).output).toMatch(/not found/);
+    expect((await executeTool('edit_file', { path: 'a.txt', old_string: 'x', new_string: 'y' }, c, ALL)).output).toMatch(/matches 2/);
+    expect((await executeTool('read_file', { path: '../etc/passwd' }, c, ALL)).output).toMatch(/outside/);
+    expect((await executeTool('nope', {}, c, ALL)).output).toMatch(/Unknown tool/);
+    expect((await executeTool('write_file', { path: 'a' }, c, ALL)).output).toMatch(/Invalid arguments/);
+    expect((await executeTool('write_file', { path: 'a', content: '' }, c, ['read_file'])).output).toMatch(/not available/);
+  });
+
+  it('edit_file tolerates trailing whitespace and preserves CRLF', async () => {
+    const root = tmpDir();
+    const c = ctx(root);
+    fs.writeFileSync(path.join(root, 'w.txt'), 'line one   \r\nline two\r\n');
+    const e = await executeTool('edit_file', { path: 'w.txt', old_string: 'line one\nline two', new_string: 'A\nB' }, c, ALL);
+    expect(e.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'w.txt'), 'utf8')).toBe('A\r\nB\r\n');
+  });
+
+  it('searches code and finds files, skipping node_modules', async () => {
+    const root = tmpDir();
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.mkdirSync(path.join(root, 'node_modules/pkg'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'src/a.ts'), 'export function greet() {}\n');
+    fs.writeFileSync(path.join(root, 'src/b.py'), 'def greet(): pass\n');
+    fs.writeFileSync(path.join(root, 'node_modules/pkg/index.js'), 'function greet() {}\n');
+    const c = ctx(root);
+    const s = await executeTool('search_code', { pattern: 'greet' }, c, ALL);
+    expect(s.output).toContain('src/a.ts:1');
+    expect(s.output).toContain('src/b.py:1');
+    expect(s.output).not.toContain('node_modules');
+    const g = await executeTool('search_code', { pattern: 'greet', glob: '*.ts' }, c, ALL);
+    expect(g.output).not.toContain('b.py');
+    const f = await executeTool('find_files', { pattern: '*.py' }, c, ALL);
+    expect(f.output.trim()).toBe('src/b.py');
+  });
+
+  it('asks before deleting files and honours denial', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'd.txt'), 'x');
+    const denied = ctx(root, 'no');
+    const r = await executeTool('delete_file', { path: 'd.txt' }, denied, ALL);
+    expect(r.ok).toBe(false);
+    expect(denied.asked).toHaveBeenCalledOnce();
+    expect(fs.existsSync(path.join(root, 'd.txt'))).toBe(true);
+    const ok = ctx(root, 'yes');
+    expect((await executeTool('delete_file', { path: 'd.txt' }, ok, ALL)).ok).toBe(true);
+    expect(fs.existsSync(path.join(root, 'd.txt'))).toBe(false);
+  });
+
+  it('runs safe commands without approval, blocks dangerous ones, and asks for others', async () => {
+    const root = tmpDir();
+    const c = ctx(root, 'no');
+    const safe = await executeTool('run_command', { command: 'echo hello' }, c, ALL);
+    expect(safe.ok).toBe(true);
+    expect(safe.output).toContain('hello');
+    expect(c.asked).not.toHaveBeenCalled();
+
+    const blocked = await executeTool('run_command', { command: 'rm -rf /' }, c, ALL);
+    expect(blocked.ok).toBe(false);
+    expect(blocked.output).toMatch(/blocked/);
+
+    const denied = await executeTool('run_command', { command: 'node -e "console.log(1)"' }, c, ALL);
+    expect(denied.ok).toBe(false);
+    expect(denied.output).toMatch(/denied/);
+    expect(c.asked).toHaveBeenCalledOnce();
+
+    const always = ctx(root, 'always');
+    const first = await executeTool('run_command', { command: 'node -e "console.log(41+1)"' }, always, ALL);
+    expect(first.output).toContain('42');
+    await executeTool('run_command', { command: 'node -e "console.log(41+1)"' }, always, ALL);
+    expect(always.asked).toHaveBeenCalledOnce();
+  });
+
+  it('produces JSON schemas for Ollama tool calling', () => {
+    const specs = toolSpecs(['read_file', 'write_file']);
+    expect(specs).toHaveLength(2);
+    const params = specs[0]!.function.parameters as { properties: Record<string, unknown>; required: string[] };
+    expect(params.properties.path).toBeDefined();
+    expect(params.required).toContain('path');
+  });
+});
