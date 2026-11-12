@@ -1,0 +1,51 @@
+{
+  "name": "localloom",
+  "version": "0.1.0",
+  "description": "LocalLoom — a fully local, multi-agent AI coding assistant for your terminal, powered by Ollama.",
+  "type": "module",
+  "bin": {
+    "localloom": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "ollama",
+    "tui",
+    "local",
+    "llm",
+    "cli"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "diff": "^8.0.4",
+    "ink": "^6.8.0",
+    "picomatch": "^4.0.7",
+    "react": "^19.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/picomatch": "^4.0.3",
+    "@types/react": "^19.3.0",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
+  }
+}
