@@ -1,0 +1,31 @@
+export interface CommandInfo {
+  name: string;
+  args?: string;
+  description: string;
+  aliases?: string[];
+}
+
+export const COMMANDS: CommandInfo[] = [
+  { name: '/models', args: '[model]', description: 'View and select installed Ollama models' },
+  { name: '/auto', description: 'Enable Auto mode — a local SLM routes models to agents' },
+  { name: '/manual', args: '[model]', description: 'Enable Manual mode — you choose the model' },
+  { name: '/agents', description: 'Show agent roles, assigned models and status' },
+  { name: '/approve', description: 'Toggle auto-approval of commands and file deletions' },
+  { name: '/clear', description: 'Clear the screen and in-memory conversation context' },
+  { name: '/help', description: 'Show commands and keyboard shortcuts' },
+  { name: '/exit', description: 'Exit LocalLoom', aliases: ['/quit', '/q'] },
+];
+
+export function matchCommands(input: string): CommandInfo[] {
+  if (!input.startsWith('/') || input.includes(' ')) return [];
+  const q = input.toLowerCase();
+  return COMMANDS.filter((c) => c.name.startsWith(q) || c.aliases?.some((a) => a.startsWith(q)));
+}
+
+export function parseCommand(input: string): { name: string; args: string } | undefined {
+  const m = /^\/(\S+)\s*(.*)$/s.exec(input.trim());
+  if (!m) return undefined;
+  const raw = `/${m[1]!.toLowerCase()}`;
+  const cmd = COMMANDS.find((c) => c.name === raw || c.aliases?.includes(raw));
+  return { name: cmd?.name ?? raw, args: m[2]!.trim() };
+}
