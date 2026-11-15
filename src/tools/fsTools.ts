@@ -239,9 +239,9 @@ export function editFile(
       throw new Error(
         `old_string not found in ${p}: it must match the file character for character — do not retype code from memory.` +
           (near
-            ? `\nThe closest lines in the file (${near.start}-${near.end}) are, exactly:\n<<<\n${near.text}\n>>>\nIf that is the part you meant, copy it EXACTLY (same quotes, commas and indentation) as old_string.`
-            : '') +
-          (total <= 400 ? `\nAlternatively, since the file has only ${total} lines, rewrite it completely with write_file.` : ''),
+            ? `\nThe closest lines in the file are:\n${numberedLines(lines, near.start, near.end)}\nIf that is the part you meant, do NOT retype it: call edit_file again with start_line=${near.start}, end_line=${near.end} and new_string to replace exactly those lines.`
+            : '\nUse read_file to find the right lines, then call edit_file with start_line, end_line and new_string.') +
+          ` Do not rewrite the whole file (${total} lines) — change only the lines that need to change.`,
       );
     }
     if (hits.length > 1 && !replaceAll) throw tooMany(hits.length);
@@ -259,6 +259,94 @@ export function editFile(
   ws.snapshot(abs);
   fs.writeFileSync(abs, usesCrlf ? content.replace(/\n/g, '\r\n') : content, 'utf8');
   return { replacements, note };
+}
+
+/** Lines [from, to] (1-based, inclusive) formatted like read_file output. */
+export function numberedLines(lines: string[], from: number, to: number): string {
+  const a = Math.max(1, from);
+  const b = Math.min(lines.length, to);
+  const width = String(b).length;
+  const out: string[] = [];
+  for (let i = a; i <= b; i++) out.push(`${String(i).padStart(width, ' ')}│ ${lines[i - 1]}`);
+  return out.join('\n');
+}
+
+/**
+ * Replace lines [startLine, endLine] (1-based, inclusive) with newString. Small models can edit by
+ * line number instead of retyping the old code exactly. If `expectedOld` is given it must roughly
+ * match the current lines, which guards against stale line numbers.
+ */
+export function editLines(
+  ws: Workspace,
+  p: string,
+  startLine: number,
+  endLine: number,
+  newString: string,
+  expectedOld?: string,
+): { removed: number; inserted: number; snippet: string; reindented: boolean } {
+  const abs = ws.resolveWritable(p);
+  if (!fs.existsSync(abs)) throw new Error(`File not found: ${p}. Use write_file to create new files.`);
+  const original = fs.readFileSync(abs, 'utf8');
+  const usesCrlf = original.includes('\r\n');
+  const lines = (usesCrlf ? original.replace(/\r\n/g, '\n') : original).split('\n');
+  const hasFinalNewline = lines.length > 1 && lines[lines.length - 1] === '';
+  const count = hasFinalNewline ? lines.length - 1 : lines.length;
+  if (
+    !Number.isInteger(startLine) ||
+    !Number.isInteger(endLine) ||
+    startLine < 1 ||
+    endLine < startLine - 1 ||
+    startLine > count + 1 ||
+    endLine > count
+  ) {
+    throw new Error(
+      `Invalid line range ${startLine}-${endLine} for ${p} (the file has ${count} lines). Use 1 ≤ start_line ≤ end_line ≤ ${count}; to insert without removing anything use end_line = start_line - 1.`,
+    );
+  }
+  const current = lines.slice(startLine - 1, endLine).join('\n');
+  if (expectedOld !== undefined && expectedOld.trim() && current.trim()) {
+    const want = stripLineNumbers(expectedOld.replace(/\r\n/g, '\n'));
+    if (similarity(current, want) < 0.5) {
+      throw new Error(
+        `Lines ${startLine}-${endLine} of ${p} do not look like your old_string — the line numbers are probably stale. Current lines:\n${numberedLines(lines, startLine, endLine)}\nRe-read the file and try again.`,
+      );
+    }
+  }
+  let replacement =
+    newString === '' ? [] : stripLineNumbers(newString.replace(/\r\n/g, '\n')).replace(/\n$/, '').split('\n');
+  // Small models often drop all indentation from replacement lines; in indentation-sensitive code that
+  // breaks the file. If the new lines have no indentation at all but the replaced lines did, restore it.
+  let reindented = false;
+  const minIndent = (ls: string[]) => {
+    const ind = ls.filter((l) => l.trim()).map((l) => indentOf(l));
+    return ind.length ? ind.reduce((a, b) => (b.length < a.length ? b : a)) : '';
+  };
+  const oldIndent = minIndent(lines.slice(startLine - 1, endLine));
+  if (replacement.length && oldIndent && minIndent(replacement) === '') {
+    replacement = replacement.map((l) => (l.trim() ? oldIndent + l : l));
+    reindented = true;
+  }
+  lines.splice(startLine - 1, endLine - startLine + 1, ...replacement);
+  ws.snapshot(abs);
+  const content = lines.join('\n');
+  fs.writeFileSync(abs, usesCrlf ? content.replace(/\n/g, '\r\n') : content, 'utf8');
+  return {
+    removed: endLine - startLine + 1,
+    inserted: replacement.length,
+    reindented,
+    snippet: numberedLines(lines, startLine - 3, startLine + replacement.length + 2),
+  };
+}
+
+/** The region around `needle` with fresh line numbers, so the agent can chain further edits. */
+export function snippetAround(ws: Workspace, p: string, needle: string): string {
+  const lines = fs.readFileSync(ws.resolve(p), 'utf8').replace(/\r\n/g, '\n').split('\n');
+  const needleLines = needle.split('\n');
+  const first = needleLines.find((l) => l.trim());
+  if (!first) return '';
+  const idx = lines.findIndex((l) => l.includes(first.trim()));
+  if (idx === -1) return '';
+  return numberedLines(lines, idx + 1 - 3, idx + needleLines.length + 3);
 }
 
 export function deleteFile(ws: Workspace, p: string): void {

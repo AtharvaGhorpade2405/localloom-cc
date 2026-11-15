@@ -190,7 +190,82 @@ describe('edit_file tolerance (small-model mistakes)', () => {
     expect(r.ok).toBe(false);
     expect(r.output).toContain("('7', 1, 0), ('8', 1, 1),");
     expect(r.output).toMatch(/do not retype code from memory/);
-    expect(r.output).toMatch(/rewrite it completely with write_file/);
+    expect(r.output).toMatch(/start_line=3, end_line=6/);
+    expect(r.output).toMatch(/Do not rewrite the whole file/);
     expect(fs.readFileSync(path.join(root, 'c.py'), 'utf8')).toBe(src); // nothing was changed
+  });
+});
+
+describe('edit in place, never rewrite existing files', () => {
+  const ALL_TOOLS = TOOLS.map((t) => t.name);
+  const src = ['line one', 'line two', 'line three', 'line four', ''].join('\n');
+
+  it('refuses to overwrite a file that existed before the task', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'a.py'), src);
+    const c = ctx(root);
+    const r = await executeTool('write_file', { path: 'a.py', content: 'everything replaced\n' }, c, ALL_TOOLS);
+    expect(r.ok).toBe(false);
+    expect(r.output).toMatch(/already exists.*NOT overwritten/s);
+    expect(r.output).toMatch(/edit_file/);
+    expect(fs.readFileSync(path.join(root, 'a.py'), 'utf8')).toBe(src);
+  });
+
+  it('still allows rewriting files created during this task, or when the user asked for a rewrite', async () => {
+    const root = tmpDir();
+    const c = ctx(root);
+    expect((await executeTool('write_file', { path: 'new.py', content: 'v1\n' }, c, ALL_TOOLS)).ok).toBe(true);
+    expect((await executeTool('write_file', { path: 'new.py', content: 'v2\n' }, c, ALL_TOOLS)).ok).toBe(true);
+    fs.writeFileSync(path.join(root, 'old.py'), src);
+    const allowed = { ...ctx(root), allowOverwrite: true };
+    expect((await executeTool('write_file', { path: 'old.py', content: 'rewritten\n' }, allowed, ALL_TOOLS)).ok).toBe(true);
+  });
+
+  it('edits by line range and returns the updated region with current line numbers', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'a.py'), src);
+    const c = ctx(root);
+    const r = await executeTool('edit_file', { path: 'a.py', start_line: 2, end_line: 3, new_string: 'TWO\nTWO-B\nTHREE' }, c, ALL_TOOLS);
+    expect(r.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'a.py'), 'utf8')).toBe('line one\nTWO\nTWO-B\nTHREE\nline four\n');
+    expect(r.output).toContain('5│ line four');
+    // insert without removing: end_line = start_line - 1
+    const ins = await executeTool('edit_file', { path: 'a.py', start_line: 1, end_line: 0, new_string: '# header' }, c, ALL_TOOLS);
+    expect(ins.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'a.py'), 'utf8').startsWith('# header\nline one\n')).toBe(true);
+  });
+
+  it('rejects bad or stale line ranges without changing the file', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'a.py'), src);
+    const c = ctx(root);
+    expect((await executeTool('edit_file', { path: 'a.py', start_line: 3, end_line: 9, new_string: 'x' }, c, ALL_TOOLS)).output).toMatch(/Invalid line range.*4 lines/);
+    const stale = await executeTool('edit_file', { path: 'a.py', start_line: 1, end_line: 1, old_string: 'def totally_different_function():', new_string: 'x' }, c, ALL_TOOLS);
+    expect(stale.output).toMatch(/stale/);
+    expect(fs.readFileSync(path.join(root, 'a.py'), 'utf8')).toBe(src);
+    expect((await executeTool('edit_file', { path: 'a.py', new_string: 'x' }, c, ALL_TOOLS)).output).toMatch(/start_line\/end_line or old_string/);
+  });
+});
+
+describe('line-range edit safeguards', () => {
+  const ALL_TOOLS = TOOLS.map((t) => t.name);
+
+  it('restores indentation the model dropped', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'c.py'), 'class A:\n    def f(self):\n        x = 1\n        return x\n');
+    const c = ctx(root);
+    const r = await executeTool('edit_file', { path: 'c.py', start_line: 3, end_line: 3, new_string: 'x = 2\ny = 3' }, c, ALL_TOOLS);
+    expect(r.output).toMatch(/indentation was restored/);
+    expect(fs.readFileSync(path.join(root, 'c.py'), 'utf8')).toBe('class A:\n    def f(self):\n        x = 2\n        y = 3\n        return x\n');
+  });
+
+  it('warns immediately when an edit breaks the syntax', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'a.js'), 'const a = 1;\nconst b = 2;\n');
+    const c = ctx(root);
+    const r = await executeTool('edit_file', { path: 'a.js', start_line: 2, end_line: 2, new_string: 'const b = ;' }, c, ALL_TOOLS);
+    expect(r.ok).toBe(true);
+    expect(r.output).toMatch(/WARNING: after this edit the file has a syntax error/);
+    expect(r.summary).toMatch(/syntax error/);
   });
 });

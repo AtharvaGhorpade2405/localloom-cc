@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { LocalLoomConfig } from '../config.js';
 import type { ToolSpec } from '../ollama/types.js';
 import { assessCommand } from './commandSafety.js';
-import { deleteFile, editFile, findFiles, listDir, readFile, searchCode, writeFile } from './fsTools.js';
+import { deleteFile, editFile, editLines, findFiles, listDir, readFile, searchCode, snippetAround, writeFile } from './fsTools.js';
 import { runShellCommand } from './runCommand.js';
 import { checkFile, detectNeverExiting } from './verify.js';
 import type { Workspace } from './workspace.js';
@@ -37,6 +37,8 @@ export interface ToolContext {
   policy: ApprovalPolicy;
   signal?: AbortSignal;
   requestApproval: (req: ApprovalRequest) => Promise<ApprovalDecision>;
+  /** Allow write_file to overwrite files that existed before the task (only when the user asked for a rewrite). */
+  allowOverwrite?: boolean;
 }
 
 export interface ToolOutput {
@@ -59,6 +61,18 @@ export interface ToolDefinition {
 }
 
 const optInt = z.coerce.number().int().positive().optional();
+
+/** After an edit, syntax-check the file so the agent hears about breakage immediately. */
+async function syntaxWarning(ctx: ToolContext, p: string): Promise<string> {
+  try {
+    const abs = ctx.workspace.resolve(p);
+    const check = await checkFile(abs, ctx.workspace.relative(abs), ctx.workspace.root);
+    if (!check || check.ok) return '';
+    return `\n\nWARNING: after this edit the file has a syntax error (${check.checker}):\n${check.message}\nFix it next with another small edit_file.`;
+  } catch {
+    return '';
+  }
+}
 const optBool = z
   .union([z.boolean(), z.string().transform((s) => s.toLowerCase() === 'true')])
   .optional();
@@ -145,16 +159,26 @@ export const TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'write_file',
     description:
-      'Create a new file or completely overwrite an existing file with the given content. Parent folders are created automatically. Always provide the COMPLETE file content.',
+      'Create a NEW file with the given complete content (parent folders are created automatically). Do not use it to change files that already exist — use edit_file for that.',
     schema: z.object({
       path: z.string().describe('File path relative to the project root'),
-      content: z.string().describe('The full content of the file'),
+      content: z.string().describe('The full content of the new file'),
     }),
     readOnly: false,
     describe: (a) => str(a.path),
     run: async (a, ctx) => {
+      const abs = ctx.workspace.resolveWritable(a.path);
+      const rel = ctx.workspace.relative(abs);
+      if (!ctx.allowOverwrite && ctx.workspace.existedBeforeTask(abs)) {
+        return {
+          ok: false,
+          output:
+            `${rel} already exists, so it was NOT overwritten. Do not rewrite existing files — change only what needs to change with edit_file. ` +
+            `Read the file, then call edit_file with start_line, end_line and new_string (the line numbers from read_file), or with an exact old_string.`,
+          summary: 'refused: file exists, use edit_file',
+        };
+      }
       const { created, lines } = writeFile(ctx.workspace, a.path, a.content);
-      const rel = ctx.workspace.relative(ctx.workspace.resolve(a.path));
       return {
         ok: true,
         output: `${created ? 'Created' : 'Overwrote'} ${rel} (${lines} lines).`,
@@ -165,21 +189,38 @@ export const TOOLS: ToolDefinition[] = [
   defineTool({
     name: 'edit_file',
     description:
-      'Edit an existing file by replacing an exact snippet of text. old_string must match the file exactly (copy it from read_file output, without line numbers) and be unique unless replace_all is true.',
+      'Change part of an existing file. Either give start_line and end_line (line numbers from read_file) plus new_string to replace exactly those lines, or give old_string (copied exactly from the file, without line numbers) plus new_string. Only the changed lines are touched.',
     schema: z.object({
       path: z.string().describe('File path relative to the project root'),
-      old_string: z.string().describe('Exact existing text to replace'),
+      start_line: optInt.describe('First line to replace (1-based, from read_file)'),
+      end_line: z.coerce.number().int().min(0).optional().describe('Last line to replace (inclusive). Use start_line - 1 to insert without removing'),
+      old_string: z.string().optional().describe('Exact existing text to replace (alternative to line numbers)'),
       new_string: z.string().describe('Replacement text'),
-      replace_all: optBool.describe('Replace every occurrence (default false)'),
+      replace_all: optBool.describe('With old_string: replace every occurrence (default false)'),
     }),
     readOnly: false,
-    describe: (a) => str(a.path),
+    describe: (a) => `${str(a.path)}${a.start_line ? `:${a.start_line}-${a.end_line ?? a.start_line}` : ''}`,
     run: async (a, ctx) => {
+      if (a.start_line !== undefined) {
+        const end = a.end_line ?? a.start_line;
+        const r = editLines(ctx.workspace, a.path, a.start_line, end, a.new_string, a.old_string);
+        const syntax = await syntaxWarning(ctx, a.path);
+        return {
+          ok: true,
+          output: `Edited ${a.path}: replaced lines ${a.start_line}-${end} (${r.removed} removed, ${r.inserted} inserted)${r.reindented ? '; your lines had no indentation, so the original indentation was restored' : ''}. Updated region (line numbers below are current):\n${r.snippet}${syntax}`,
+          summary: `lines ${a.start_line}-${end} · -${r.removed} +${r.inserted}${r.reindented ? ' · re-indented' : ''}${syntax ? ' · syntax error' : ''}`,
+        };
+      }
+      if (a.old_string === undefined) {
+        throw new Error('Provide either start_line/end_line or old_string to say which part of the file to change.');
+      }
       const { replacements, note } = editFile(ctx.workspace, a.path, a.old_string, a.new_string, a.replace_all ?? false);
+      const snippet = snippetAround(ctx.workspace, a.path, a.new_string);
+      const syntax = await syntaxWarning(ctx, a.path);
       return {
         ok: true,
-        output: `Edited ${a.path}: ${replacements} replacement(s) applied${note ? ` (${note}). Read the file to confirm the result` : ''}.`,
-        summary: `${replacements} replacement(s)${note ? ' · re-indented' : ''}`,
+        output: `Edited ${a.path}: ${replacements} replacement(s) applied${note ? ` (${note})` : ''}.${snippet ? ` Updated region (line numbers below are current):\n${snippet}` : ''}${syntax}`,
+        summary: `${replacements} replacement(s)${note ? ' · re-indented' : ''}${syntax ? ' · syntax error' : ''}`,
       };
     },
   }),

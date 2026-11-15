@@ -42,6 +42,8 @@ interface MemoryEntry {
 const ACTION_WORDS =
   /\b(create|add|fix|implement|refactor|write|update|change|remove|delete|rename|build|make|edit|install|convert|replace|generate|set ?up|scaffold|migrate|improve|optimi[sz]e|move)\b/i;
 
+const REWRITE_WORDS = /\b(rewrite|re-write|from scratch|start over|overwrite|replace (the )?(whole|entire))\b/i;
+
 export function parsePlan(raw: string, request: string): Plan {
   const json = extractTrailingJson(raw, 'needs_changes');
   const strList = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean) : []);
@@ -216,6 +218,8 @@ export class Session {
       policy: this.policy,
       signal,
       requestApproval,
+      // Existing files are edited in place; whole-file rewrites only when the user asks for one.
+      allowOverwrite: REWRITE_WORDS.test(task),
     };
     const run = (role: AgentRole, model: string, prompt: string, extra: Partial<Parameters<typeof runAgent>[0]> = {}, label?: string) => {
       emit({ type: 'agent:start', agent: role, model, label });
@@ -293,7 +297,7 @@ export class Session {
         {
           checkFinal: (_content, stats) =>
             stats.mutatingCalls === 0 && this.workspace.changedFiles().length === 0
-              ? 'You have not changed any files yet. Implement the plan NOW by calling write_file or edit_file (and run_command if needed). If truly nothing needs to change, explain why.'
+              ? 'You have not changed any files yet. Implement the plan NOW: create new files with write_file and change existing ones with edit_file (and run_command if needed). If truly nothing needs to change, explain why.'
               : undefined,
         },
       );

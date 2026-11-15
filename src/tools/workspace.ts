@@ -95,6 +95,13 @@ export class Workspace {
     this.originals.set(rel, fs.existsSync(abs) ? fs.readFileSync(abs, 'utf8') : null);
   }
 
+  /** True if the file existed before the current task started (i.e. it is not something the agents created). */
+  existedBeforeTask(abs: string): boolean {
+    const rel = this.relative(abs);
+    if (this.originals.has(rel)) return this.originals.get(rel) !== null;
+    return fs.existsSync(abs);
+  }
+
   /** Start tracking a new task's changes. */
   resetChanges(): void {
     this.originals.clear();
