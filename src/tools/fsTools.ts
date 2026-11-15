@@ -118,48 +118,147 @@ function normalizeWs(s: string): string {
     .join('\n');
 }
 
+/** Line-number prefixes from read_file output ("12│ code") that models sometimes copy into old_string. */
+const LINE_NO_PREFIX = /^\s*\d+\s*│ ?/;
+
+function stripLineNumbers(s: string): string {
+  const lines = s.split('\n');
+  const nonEmpty = lines.filter((l) => l.trim());
+  if (nonEmpty.length && nonEmpty.every((l) => LINE_NO_PREFIX.test(l))) return lines.map((l) => l.replace(LINE_NO_PREFIX, '')).join('\n');
+  return s;
+}
+
+function trimBlankLines(lines: string[]): string[] {
+  let a = 0;
+  let b = lines.length;
+  while (a < b && !lines[a]!.trim()) a++;
+  while (b > a && !lines[b - 1]!.trim()) b--;
+  return lines.slice(a, b);
+}
+
+const indentOf = (l: string) => /^[ \t]*/.exec(l)![0];
+
+/** Start indices where `block` matches `lines` ignoring indentation and surrounding whitespace. */
+function findBlockIgnoringIndent(lines: string[], block: string[]): number[] {
+  const target = block.map((l) => l.trim());
+  const hits: number[] = [];
+  if (!target.length) return hits;
+  for (let i = 0; i + target.length <= lines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < target.length; j++) {
+      if (lines[i + j]!.trim() !== target[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) hits.push(i);
+  }
+  return hits;
+}
+
+function bigrams(s: string): Map<string, number> {
+  const m = new Map<string, number>();
+  const t = s.replace(/\s+/g, ' ');
+  for (let i = 0; i < t.length - 1; i++) {
+    const g = t.slice(i, i + 2);
+    m.set(g, (m.get(g) ?? 0) + 1);
+  }
+  return m;
+}
+
+function similarity(a: string, b: string): number {
+  const A = bigrams(a);
+  const B = bigrams(b);
+  let inter = 0;
+  let total = 0;
+  for (const [g, n] of A) {
+    inter += Math.min(n, B.get(g) ?? 0);
+    total += n;
+  }
+  for (const n of B.values()) total += n;
+  return total ? (2 * inter) / total : 0;
+}
+
+/** The region of the file that most resembles what the model tried to replace (for the error message). */
+export function closestRegion(content: string, oldString: string): { start: number; end: number; text: string } | undefined {
+  const lines = content.split('\n');
+  const target = trimBlankLines(oldString.split('\n'));
+  if (!target.length || lines.length > 5000) return undefined;
+  const k = Math.min(target.length, lines.length, 60);
+  const want = target.slice(0, k).join('\n');
+  let best = { i: 0, score: -1 };
+  for (let i = 0; i + k <= lines.length; i++) {
+    const score = similarity(lines.slice(i, i + k).join('\n'), want);
+    if (score > best.score) best = { i, score };
+  }
+  if (best.score < 0.3) return undefined;
+  return { start: best.i + 1, end: best.i + k, text: lines.slice(best.i, best.i + k).join('\n') };
+}
+
 export function editFile(
   ws: Workspace,
   p: string,
   oldString: string,
   newString: string,
   replaceAll = false,
-): { replacements: number } {
+): { replacements: number; note?: string } {
   const abs = ws.resolveWritable(p);
   if (!fs.existsSync(abs)) throw new Error(`File not found: ${p}. Use write_file to create new files.`);
   const original = fs.readFileSync(abs, 'utf8');
   if (oldString === '') throw new Error('old_string must not be empty. Use write_file to replace a whole file.');
   const usesCrlf = original.includes('\r\n');
   let content = usesCrlf ? original.replace(/\r\n/g, '\n') : original;
-  const oldN = oldString.replace(/\r\n/g, '\n');
-  const newN = newString.replace(/\r\n/g, '\n');
+  const oldN = stripLineNumbers(oldString.replace(/\r\n/g, '\n'));
+  const newN = stripLineNumbers(newString.replace(/\r\n/g, '\n'));
+  const tooMany = (n: number) =>
+    new Error(`old_string matches ${n} places in ${p}; include more surrounding lines to make it unique, or set replace_all=true.`);
 
-  let count = content.split(oldN).length - 1;
-  if (count === 0) {
-    // Retry ignoring trailing whitespace differences, line by line.
-    const normContent = normalizeWs(content);
-    const normOld = normalizeWs(oldN);
-    const c2 = normContent.split(normOld).length - 1;
-    if (c2 === 0) {
+  let replacements = 1;
+  let note: string | undefined;
+  const exact = content.split(oldN).length - 1;
+  const normContent = normalizeWs(content);
+  const normOld = normalizeWs(oldN);
+  const loose = exact ? 0 : normContent.split(normOld).length - 1;
+  if (exact) {
+    if (exact > 1 && !replaceAll) throw tooMany(exact);
+    content = replaceAll ? content.split(oldN).join(newN) : content.replace(oldN, () => newN);
+    replacements = replaceAll ? exact : 1;
+  } else if (loose) {
+    // Only trailing-whitespace differences.
+    if (loose > 1 && !replaceAll) throw tooMany(loose);
+    content = replaceAll ? normContent.split(normOld).join(newN) : normContent.replace(normOld, () => newN);
+    replacements = replaceAll ? loose : 1;
+  } else {
+    // Indentation differences: match whole lines ignoring leading whitespace, then re-indent the replacement.
+    const lines = content.split('\n');
+    const oldLines = trimBlankLines(oldN.split('\n'));
+    const hits = findBlockIgnoringIndent(lines, oldLines);
+    if (hits.length === 0) {
+      const near = closestRegion(content, oldN);
+      const total = lines.length;
       throw new Error(
-        `old_string not found in ${p}. Read the file again and copy the exact text (including indentation) you want to replace.`,
+        `old_string not found in ${p}: it must match the file character for character — do not retype code from memory.` +
+          (near
+            ? `\nThe closest lines in the file (${near.start}-${near.end}) are, exactly:\n<<<\n${near.text}\n>>>\nIf that is the part you meant, copy it EXACTLY (same quotes, commas and indentation) as old_string.`
+            : '') +
+          (total <= 400 ? `\nAlternatively, since the file has only ${total} lines, rewrite it completely with write_file.` : ''),
       );
     }
-    content = normContent;
-    count = c2;
-    if (count > 1 && !replaceAll) {
-      throw new Error(`old_string matches ${count} places in ${p}; include more surrounding context or set replace_all=true.`);
+    if (hits.length > 1 && !replaceAll) throw tooMany(hits.length);
+    const oldIndent = indentOf(oldLines[0]!);
+    for (const start of [...hits].reverse()) {
+      const fileIndent = indentOf(lines[start]!);
+      const replacement = newN === '' ? [] : trimBlankLines(newN.split('\n')).map((l) => (l.startsWith(oldIndent) && l.trim() ? fileIndent + l.slice(oldIndent.length) : l));
+      lines.splice(start, oldLines.length, ...replacement);
+      if (!replaceAll) break;
     }
-    content = replaceAll ? content.split(normOld).join(newN) : content.replace(normOld, () => newN);
-  } else {
-    if (count > 1 && !replaceAll) {
-      throw new Error(`old_string matches ${count} places in ${p}; include more surrounding context or set replace_all=true.`);
-    }
-    content = replaceAll ? content.split(oldN).join(newN) : content.replace(oldN, () => newN);
+    content = lines.join('\n');
+    replacements = replaceAll ? hits.length : 1;
+    note = 'matched ignoring indentation; the replacement was re-indented to fit';
   }
   ws.snapshot(abs);
   fs.writeFileSync(abs, usesCrlf ? content.replace(/\n/g, '\r\n') : content, 'utf8');
-  return { replacements: replaceAll ? count : 1 };
+  return { replacements, note };
 }
 
 export function deleteFile(ws: Workspace, p: string): void {

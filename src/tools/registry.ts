@@ -174,11 +174,11 @@ export const TOOLS: ToolDefinition[] = [
     readOnly: false,
     describe: (a) => str(a.path),
     run: async (a, ctx) => {
-      const { replacements } = editFile(ctx.workspace, a.path, a.old_string, a.new_string, a.replace_all ?? false);
+      const { replacements, note } = editFile(ctx.workspace, a.path, a.old_string, a.new_string, a.replace_all ?? false);
       return {
         ok: true,
-        output: `Edited ${a.path}: ${replacements} replacement(s) applied.`,
-        summary: `${replacements} replacement(s)`,
+        output: `Edited ${a.path}: ${replacements} replacement(s) applied${note ? ` (${note}). Read the file to confirm the result` : ''}.`,
+        summary: `${replacements} replacement(s)${note ? ' · re-indented' : ''}`,
       };
     },
   }),

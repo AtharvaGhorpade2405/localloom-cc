@@ -135,3 +135,62 @@ describe('tools', () => {
     expect(params.required).toContain('path');
   });
 });
+
+describe('edit_file tolerance (small-model mistakes)', () => {
+  const ALL_TOOLS = TOOLS.map((t) => t.name);
+  const src = [
+    'class Calc:',
+    '    def __init__(self):',
+    '        buttons = [',
+    "            ('7', 1, 0), ('8', 1, 1),",
+    "            ('4', 2, 0), ('5', 2, 1),",
+    '        ]',
+    '',
+  ].join('\n');
+
+  it('strips line-number prefixes copied from read_file output', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'c.py'), src);
+    const c = ctx(root);
+    const r = await executeTool(
+      'edit_file',
+      { path: 'c.py', old_string: "4│             ('7', 1, 0), ('8', 1, 1),", new_string: "4│             ('7', 1, 0), ('8', 1, 1), ('.', 1, 2)," },
+      c,
+      ALL_TOOLS,
+    );
+    expect(r.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'c.py'), 'utf8')).toContain("('8', 1, 1), ('.', 1, 2),");
+  });
+
+  it('matches ignoring indentation and re-indents the replacement', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'c.py'), src);
+    const c = ctx(root);
+    const r = await executeTool(
+      'edit_file',
+      {
+        path: 'c.py',
+        old_string: "buttons = [\n    ('7', 1, 0), ('8', 1, 1),",
+        new_string: "buttons = [\n    ('C', 0, 0),\n    ('7', 1, 0), ('8', 1, 1),",
+      },
+      c,
+      ALL_TOOLS,
+    );
+    expect(r.ok).toBe(true);
+    expect(r.output).toMatch(/re-indented/);
+    expect(fs.readFileSync(path.join(root, 'c.py'), 'utf8')).toContain("        buttons = [\n            ('C', 0, 0),\n            ('7', 1, 0), ('8', 1, 1),\n            ('4', 2, 0)");
+  });
+
+  it('shows the closest real lines when the model retyped the code wrongly', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'c.py'), src);
+    const c = ctx(root);
+    // Real failure from qwen2.5-coder:7b: quotes and commas dropped.
+    const r = await executeTool('edit_file', { path: 'c.py', old_string: 'buttons = [\n(7, 1, 0), (8, 1, 1),\n(4, 2, 0), (5, 2, 1),\n]', new_string: 'x' }, c, ALL_TOOLS);
+    expect(r.ok).toBe(false);
+    expect(r.output).toContain("('7', 1, 0), ('8', 1, 1),");
+    expect(r.output).toMatch(/do not retype code from memory/);
+    expect(r.output).toMatch(/rewrite it completely with write_file/);
+    expect(fs.readFileSync(path.join(root, 'c.py'), 'utf8')).toBe(src); // nothing was changed
+  });
+});
