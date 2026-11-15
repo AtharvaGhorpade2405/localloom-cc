@@ -166,6 +166,60 @@ describe('Session four-agent pipeline', () => {
     expect(events.filter((e) => e.type === 'agent:start').map((e) => (e as { agent: string }).agent)).toContain('reviewer');
   });
 
+  it('overrides a reviewer approval when the automatic syntax check fails', async () => {
+    const root = tmpDir();
+    let fixed = false;
+    const client = new FakeClient([model('plain:7b', { capabilities: ['completion'] })], (req) => {
+      const role = roleOf(req);
+      const last = req.messages.at(-1)!.content;
+      if (role === 'planner') return { content: '{"needs_changes": true, "summary": "s", "steps": ["write app.js"]}' };
+      if (role === 'coder') {
+        if (last.startsWith('[tool result')) return { content: 'Wrote app.js' };
+        return { content: '<write_file path="app.js">\nconst total = (a, b) => { return a + b;\n</write_file>' };
+      }
+      if (role === 'reviewer') {
+        if (!fixed) expect(last).toContain('FAIL (node --check)');
+        return { content: '{"verdict": "approve", "issues": []}' }; // a lazy reviewer approves anyway
+      }
+      // fixer
+      if (last.startsWith('[tool result')) return { content: 'Fixed the missing brace.' };
+      expect(last).toContain('Syntax check failed');
+      fixed = true;
+      return { content: '<write_file path="app.js">\nconst total = (a, b) => { return a + b; };\nmodule.exports = { total };\n</write_file>' };
+    });
+    const session = new Session({ client, config: loadConfig(), cwd: root });
+    const { events, emit } = collect();
+    await session.runTask('create app.js with a total function', emit, approveAll);
+    expect(fixed).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'app.js'), 'utf8')).toContain('module.exports');
+    const end = events.at(-1) as Extract<LoomEvent, { type: 'task:end' }>;
+    expect(end.summary).toMatch(/approved.*Syntax checks pass/);
+  });
+
+  it('feeds malformed tool calls back to the model instead of dropping them', async () => {
+    const root = tmpDir();
+    let coderTurn = 0;
+    const client = new FakeClient([model('plain:7b', { capabilities: ['completion'] })], (req) => {
+      const role = roleOf(req);
+      if (role === 'planner') return { content: '{"needs_changes": true, "summary": "s", "steps": ["x"]}' };
+      if (role === 'coder') {
+        coderTurn++;
+        if (coderTurn === 1) return { content: '{"name": "write_file", "arguments": {"path": "a.txt", "content": "unterminated' };
+        if (coderTurn === 2) {
+          expect(req.messages.at(-1)!.content).toMatch(/^\[tool error\][\s\S]*NOT executed/);
+          return { content: '<write_file path="a.txt">\nhello\n</write_file>' };
+        }
+        return { content: 'done' };
+      }
+      return { content: '{"verdict": "approve", "issues": []}' };
+    });
+    const session = new Session({ client, config: loadConfig(), cwd: root });
+    const { events, emit } = collect();
+    await session.runTask('create a.txt', emit, approveAll);
+    expect(fs.readFileSync(path.join(root, 'a.txt'), 'utf8')).toBe('hello\n');
+    expect(events.some((e) => e.type === 'notice' && /malformed tool call/.test(e.text))).toBe(true);
+  });
+
   it('cancels cleanly', async () => {
     const root = tmpDir();
     const ac = new AbortController();

@@ -4,6 +4,7 @@ import type { ToolSpec } from '../ollama/types.js';
 import { assessCommand } from './commandSafety.js';
 import { deleteFile, editFile, findFiles, listDir, readFile, searchCode, writeFile } from './fsTools.js';
 import { runShellCommand } from './runCommand.js';
+import { checkFile, detectNeverExiting } from './verify.js';
 import type { Workspace } from './workspace.js';
 
 export type ApprovalDecision = 'yes' | 'always' | 'no';
@@ -225,6 +226,18 @@ export const TOOLS: ToolDefinition[] = [
           ok: false,
           output: `Command blocked by LocalLoom safety policy (${assessment.reason}). Do not attempt it again or work around it.`,
           summary: `blocked: ${assessment.reason}`,
+        };
+      }
+      const hang = detectNeverExiting(a.command, ctx.workspace);
+      if (hang) {
+        const check = await checkFile(ctx.workspace.resolve(hang.file), hang.file, ctx.workspace.root);
+        const checkText = check
+          ? ` Instead it was syntax-checked with ${check.checker}: ${check.ok ? 'OK.' : `FAILED:\n${check.message}`}`
+          : '';
+        return {
+          ok: check ? check.ok : true,
+          output: `Not run: ${hang.file} is a program that does not exit on its own (${hang.why}), so running it would hang until the timeout. Do not try to run it again.${checkText}\nVerify its logic by reading the code, or test pure functions with a separate non-interactive script.`,
+          summary: `not run (${hang.why})${check ? ` · syntax ${check.ok ? 'OK' : 'error'}` : ''}`,
         };
       }
       const key = `cmd:${a.command.trim()}`;

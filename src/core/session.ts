@@ -9,6 +9,7 @@ import { estimateComplexity, heuristicAssignment, type Complexity } from '../rou
 import { routeTask, type Assignment, type RoutingResult } from '../router/router.js';
 import { listDir } from '../tools/fsTools.js';
 import { ApprovalPolicy, type ApprovalDecision, type ApprovalRequest, type ToolContext } from '../tools/registry.js';
+import { formatReport, verifyChanges } from '../tools/verify.js';
 import { Workspace } from '../tools/workspace.js';
 
 export type Mode = 'auto' | 'manual';
@@ -88,7 +89,7 @@ export function parseReview(raw: string): Review {
 }
 
 export function cyclesFor(complexity: Complexity, max: number): number {
-  const wanted = complexity === 'low' ? 1 : complexity === 'medium' ? 2 : 3;
+  const wanted = complexity === 'high' ? 3 : 2;
   return Math.max(1, Math.min(max, wanted));
 }
 
@@ -299,10 +300,26 @@ export class Session {
       emit({ type: 'agent:end', agent: 'coder', status: 'done' });
       let latestSummary = stripTrailingJsonBlock(codeRun.content, 'verdict');
 
-      // 4. Review → fix cycles
+      // 4. Review → fix cycles, grounded by automatic syntax checks of every changed file.
+      const verify = async () => {
+        const report = await verifyChanges(this.workspace);
+        for (const c of report.checks) {
+          emit({
+            type: 'tool:end',
+            agent: 'reviewer',
+            id: `verify-${c.path}-${Date.now()}`,
+            name: 'syntax check',
+            detail: c.path,
+            ok: c.ok,
+            summary: c.ok ? c.checker : `${c.checker} failed`,
+          });
+        }
+        return report;
+      };
       const cycles = cyclesFor(routing.complexity, this.config.maxReviewCycles);
       let review: Review | undefined;
       let unreviewedFixes = false;
+      let report = await verify();
       for (let cycle = 1; cycle <= cycles; cycle++) {
         const changed = this.workspace.changedFiles();
         const changedText = changed.length ? changed.map((c) => `- ${c.path} (${c.status})`).join('\n') : '(no files were changed)';
@@ -311,11 +328,26 @@ export class Session {
         const reviewRun = await run(
           'reviewer',
           A.reviewer,
-          `${ctx}\n\n## User request\n${task}\n\n## Plan\n${planText}\n\n## Implementer's summary\n${latestSummary.slice(0, 2000)}\n\n## Changed files\n${changedText}\n\n## Diff\n\`\`\`diff\n${this.workspace.diff() || '(empty)'}\n\`\`\`\n\nReview the changes and finish with the JSON verdict.`,
+          `${ctx}\n\n## User request\n${task}\n\n## Plan\n${planText}\n\n## Implementer's summary\n${latestSummary.slice(0, 2000)}\n\n## Changed files\n${changedText}\n\n## Automatic syntax checks (run by LocalLoom)\n${formatReport(report)}\n\n## Diff\n\`\`\`diff\n${this.workspace.diff() || '(empty)'}\n\`\`\`\n\nReview the changes and finish with the JSON verdict.`,
           {},
           `cycle ${cycle}/${cycles}`,
         );
         review = parseReview(reviewRun.content);
+        // Objective failures override the model's verdict: broken code is never approved.
+        if (!report.ok) {
+          const failed = report.checks.filter((c) => !c.ok);
+          review = {
+            ...review,
+            approved: false,
+            issues: [
+              ...failed.map((c) => ({ file: c.path, problem: `Syntax check failed (${c.checker}):\n${c.message}`, fix: 'Fix the syntax error at the reported line.' })),
+              ...review.issues,
+            ],
+          };
+        }
+        if (changed.length === 0 && review.approved && plan.needsChanges) {
+          review = { ...review, approved: false, issues: [{ problem: 'No files were created or changed, but the request requires changes. Implement it.' }, ...review.issues] };
+        }
         unreviewedFixes = false;
         emit({ type: 'agent:end', agent: 'reviewer', status: 'done', note: review.approved ? 'approved' : `${review.issues.length} issue(s)` });
         if (review.approved) break;
@@ -327,22 +359,24 @@ export class Session {
         const fixRun = await run(
           'fixer',
           A.fixer,
-          `${ctx}\n\n## User request\n${task}\n\n## Changed files so far\n${changedText}\n\n## Issues found by the Reviewer\n${issuesText}\n\nFix these issues now using the tools.`,
+          `${ctx}\n\n## User request\n${task}\n\n## Plan\n${planText}\n\n## Changed files so far\n${changedText}\n\n## Issues found by the Reviewer\n${issuesText}\n\nRead the affected files, then fix these issues now using the tools.`,
           {},
           `cycle ${cycle}/${cycles}`,
         );
         emit({ type: 'agent:end', agent: 'fixer', status: 'done' });
         latestSummary = fixRun.content;
         unreviewedFixes = true;
+        report = await verify();
       }
       if (review?.approved) emit({ type: 'agent:end', agent: 'fixer', status: 'skipped', note: 'no issues' });
 
       const changed = this.workspace.changedFiles();
       const files = changed.map((c) => `${c.path} (${c.status})`);
+      const checksNote = report.checks.length ? (report.ok ? ' Syntax checks pass.' : ' Syntax errors remain — see the check results above.') : '';
       let summary: string;
-      if (review?.approved) summary = 'Reviewer approved the changes.';
-      else if (unreviewedFixes) summary = `Fixes applied after the final review cycle (limit ${cycles} reached; not re-reviewed).`;
-      else summary = 'Review cycle limit reached with open issues.';
+      if (review?.approved) summary = `Reviewer approved the changes.${checksNote}`;
+      else if (unreviewedFixes) summary = `Fixes applied after the final review cycle (limit ${cycles} reached; not re-reviewed).${checksNote}`;
+      else summary = `Review cycle limit reached with open issues.${checksNote}`;
       this.memory.push({
         request: task,
         outcome: `${summary} Files: ${files.join(', ') || 'none'}. ${latestSummary.slice(0, 300)}`,
