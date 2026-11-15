@@ -21,7 +21,11 @@ localloom
   - File deletion and any command that is not read-only need your approval (*once* / *always this session* / *deny*).
   - Destructive commands are always blocked: `rm -rf /`, `format`, `sudo`, `curl | sh`, force-push, registry edits and similar.
   - Commands have timeouts and can be cancelled with `esc`.
-- Works with models that have native tool calling and with models that don't (a JSON text protocol is used as a fallback). Reasoning models' thinking is shown live.
+- Works with models that have native tool calling and with models that don't (for example `deepseek-coder-v2`):
+  - Those models write files as raw `<write_file path="…">…</write_file>` blocks, so code never has to be escaped inside JSON.
+  - Broken JSON calls are repaired automatically. Anything that still can't be parsed goes back to the model as an error, never silently dropped.
+- Reasoning models' thinking is shown live.
+- **Automatic verification**: after the Coder and after each Fixer pass, every changed Python/JS/JSON file is syntax-checked without running it. Failures are always treated as review issues, even if the Reviewer model approves. LocalLoom also refuses to launch programs that never exit (GUI apps such as tkinter, servers, interactive scripts) and syntax-checks them instead.
 
 ## Requirements
 
@@ -88,6 +92,7 @@ In the model picker, `tab` / `←→` chooses which agent the model is assigned 
 | `LOCALLOOM_MAX_REVIEW_CYCLES` | `3` | Upper limit on review→fix cycles |
 | `LOCALLOOM_COMMAND_TIMEOUT` | `120` | Command timeout (s) |
 | `LOCALLOOM_SHELL` | `cmd.exe` / `/bin/sh` | Shell for commands |
+| `LOCALLOOM_DEBUG_LOG` | unset | Append every model request/response to this file (JSON lines), useful for diagnosing a model |
 
 ## How it works
 
