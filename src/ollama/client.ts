@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import {
   ChatChunkSchema,
   ShowResponseSchema,
@@ -10,6 +11,24 @@ import {
   type ToolCall,
 } from './types.js';
 import { parseParamsB } from './modelProfile.js';
+
+/** When LOCALLOOM_DEBUG_LOG is set, append every model exchange to that file (JSON lines). */
+function debugLog(request: ChatRequest, result: ChatResult): void {
+  const file = process.env.LOCALLOOM_DEBUG_LOG;
+  if (!file) return;
+  try {
+    const entry = {
+      time: new Date().toISOString(),
+      model: request.model,
+      tools: request.tools?.map((t) => t.function.name),
+      messages: request.messages,
+      response: { content: result.content, thinking: result.thinking, toolCalls: result.toolCalls, doneReason: result.doneReason },
+    };
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+  } catch {
+    /* never let logging break a run */
+  }
+}
 
 export class OllamaError extends Error {
   constructor(
@@ -238,6 +257,7 @@ export class OllamaClient implements LLMClient {
       reader.releaseLock();
     }
     result.content = result.content.trim();
+    debugLog(request, result);
     return result;
   }
 }
