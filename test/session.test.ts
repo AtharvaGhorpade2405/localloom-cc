@@ -257,3 +257,46 @@ describe('Session four-agent pipeline', () => {
     expect(end.summary).toMatch(/exploded/);
   });
 });
+
+describe('editing an existing project', () => {
+  it('applies two same-reply line edits correctly (numbers refer to the file as read)', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'app.py'), ['a = 1', 'b = 2', 'c = 3', 'd = 4', 'e = 5', ''].join('\n'));
+    let coderTurn = 0;
+    const client = new FakeClient([model('plain:7b', { capabilities: ['completion'] })], (req) => {
+      const role = roleOf(req);
+      if (role === 'planner') return { content: '{"needs_changes": true, "summary": "s", "steps": ["edit app.py"]}' };
+      if (role === 'coder') {
+        coderTurn++;
+        if (coderTurn > 1) return { content: 'Edited.' };
+        // Line 2 is replaced by two lines; line 4 must still mean "d = 4".
+        return {
+          content:
+            '<edit_file path="app.py" lines="2"><new>b = 20\nb2 = 21</new></edit_file>\n<edit_file path="app.py" lines="4"><new>d = 40</new></edit_file>',
+        };
+      }
+      return { content: '{"verdict": "approve", "issues": []}' };
+    });
+    const session = new Session({ client, config: loadConfig(), cwd: root });
+    await session.runTask('change b to 20 and d to 40 in app.py', () => {}, approveAll);
+    expect(fs.readFileSync(path.join(root, 'app.py'), 'utf8')).toBe('a = 1\nb = 20\nb2 = 21\nc = 3\nd = 40\ne = 5\n');
+  });
+
+  it('never rewrites an existing file unless the user asks for a rewrite', async () => {
+    const root = tmpDir();
+    fs.writeFileSync(path.join(root, 'app.py'), 'print(1)\n');
+    const client = new FakeClient([model('plain:7b', { capabilities: ['completion'] })], (req) => {
+      const role = roleOf(req);
+      if (role === 'planner') return { content: '{"needs_changes": true, "summary": "s", "steps": ["x"]}' };
+      if (role === 'coder' && !req.messages.at(-1)!.content.startsWith('[tool')) {
+        return { content: '<write_file path="app.py">\nprint(2)\n</write_file>' };
+      }
+      return { content: role === 'reviewer' ? '{"verdict": "approve", "issues": []}' : 'done' };
+    });
+    const session = new Session({ client, config: loadConfig(), cwd: root });
+    await session.runTask('make it print 2', () => {}, approveAll);
+    expect(fs.readFileSync(path.join(root, 'app.py'), 'utf8')).toBe('print(1)\n');
+    await session.runTask('rewrite app.py from scratch to print 2', () => {}, approveAll);
+    expect(fs.readFileSync(path.join(root, 'app.py'), 'utf8')).toBe('print(2)\n');
+  });
+});

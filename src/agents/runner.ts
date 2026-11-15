@@ -43,6 +43,38 @@ export class CancelledError extends Error {
 
 let toolSeq = 0;
 
+/** Drop exact duplicate calls within one reply (models sometimes emit the same edit twice). */
+export function dedupeCalls(calls: ToolCall[]): ToolCall[] {
+  const seen = new Set<string>();
+  return calls.filter((c) => {
+    const sig = signature(c);
+    if (seen.has(sig)) return false;
+    seen.add(sig);
+    return true;
+  });
+}
+
+/**
+ * When one reply contains several line-range edits to the same file, the model numbered all of them
+ * against the file as it read it. Applying them bottom-up keeps those numbers valid.
+ */
+export function orderEdits(calls: ToolCall[]): ToolCall[] {
+  const isLineEdit = (c: ToolCall) => getTool(c.name)?.name === 'edit_file' && c.arguments.start_line !== undefined;
+  const byPath = new Map<string, number[]>();
+  calls.forEach((c, i) => {
+    if (!isLineEdit(c)) return;
+    const key = String(c.arguments.path ?? c.arguments.file_path ?? '');
+    byPath.set(key, [...(byPath.get(key) ?? []), i]);
+  });
+  const out = [...calls];
+  for (const idx of byPath.values()) {
+    if (idx.length < 2) continue;
+    const sorted = idx.map((i) => calls[i]!).sort((a, b) => Number(b.arguments.start_line) - Number(a.arguments.start_line));
+    idx.forEach((slot, k) => (out[slot] = sorted[k]!));
+  }
+  return out;
+}
+
 /** Identical failures tolerated before an agent's turn is ended early. */
 export const STUCK_LIMIT = 4;
 
@@ -85,22 +117,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
 
   let system = agent.system;
   const writes = agent.tools.includes('write_file');
-  const fileBlocks = `To create or overwrite a file, write this raw block in your reply (no JSON, no escaping — the code exactly as it should appear in the file):
-<write_file path="relative/path.py">
-...complete file content...
-</write_file>
-
-To change part of an existing file:
-<edit_file path="relative/path.py">
-<old>
-exact existing lines, copied character for character from read_file (without the line numbers)
-</old>
+  const fileBlocks = `How to change files:
+- EXISTING files: always edit them in place and change ONLY the lines that need to change. Never rewrite a whole existing file (that is blocked).
+  The easiest way is by line number, using the numbers shown by read_file:
+<edit_file path="relative/path.py" lines="12-15">
 <new>
-replacement lines
+the new lines that replace lines 12 to 15
 </new>
 </edit_file>
-
-For files under about 200 lines it is usually easier and safer to rewrite the whole file with <write_file> than to edit it.`;
+  To insert lines without removing any, replace the line just before them with that same line followed by the new lines.
+  You can also quote exactly what to replace: <edit_file path="relative/path.py"><old>exact existing lines</old><new>replacement</new></edit_file>
+- After each edit you get the updated region with current line numbers; use those for the next edit.
+- NEW files only: write the complete content (no JSON, no escaping):
+<write_file path="relative/new_file.py">
+...complete file content...
+</write_file>`;
   if (!nativeTools) {
     system += `\n\n## Tools
 You can use these tools:
@@ -113,7 +144,7 @@ Call one tool per reply. You will then receive the result. When you are finished
   } else if (writes) {
     // Even tool-capable small models mangle code when they must escape it inside JSON arguments.
     system += `\n\n## Writing code
-You may call write_file / edit_file, but for code the raw block format is more reliable:
+You may call the edit_file / write_file tools, or use the raw block format below, which is more reliable for code:
 ${fileBlocks}`;
   }
 
@@ -207,6 +238,7 @@ ${fileBlocks}`;
       });
     }
 
+    calls = orderEdits(dedupeCalls(calls));
     for (const call of calls) {
       throwIfAborted(signal);
       const id = `t${++toolSeq}`;
@@ -216,7 +248,16 @@ ${fileBlocks}`;
       const sig = signature(call);
       const repeats = (seen.get(sig) ?? 0) + 1;
       seen.set(sig, repeats);
-      const res = await executeTool(call.name, call.arguments, toolContext, agent.tools);
+      const res =
+        repeats >= 3 && def && (def.name === 'edit_file' || def.name === 'write_file')
+          ? {
+              name: def.name,
+              args: call.arguments,
+              ok: false,
+              output: `Skipped: you already made this exact change ${repeats - 1} times. Repeating it does nothing. Read the file to see its current state, then make a DIFFERENT change or finish.`,
+              summary: 'skipped: repeated identical change',
+            }
+          : await executeTool(call.name, call.arguments, toolContext, agent.tools);
       throwIfAborted(signal);
       stats.toolCalls++;
       if (!res.ok) stats.failedCalls++;
@@ -235,7 +276,7 @@ ${fileBlocks}`;
         else if (n >= 2 && res.name === 'edit_file') {
           output += `
 
-WARNING: edit_file has now failed ${n} times the same way. Stop using edit_file for this file. Rewrite the COMPLETE file with a <write_file path="..."> block (or write_file), keeping everything that already works.`;
+WARNING: edit_file has now failed ${n} times the same way. Stop quoting old text: use the line numbers from read_file instead (edit_file with start_line, end_line and new_string, or an <edit_file path="..." lines="a-b"> block). Do not rewrite the whole file.`;
         } else if (n >= 2) {
           output += `\n\nWARNING: this exact failure has now happened ${n} times. Your previous fix did not work. Read the error message carefully and reconsider the root cause — it is often in a DIFFERENT file than the one you keep editing (e.g. a missing export, wrong import style, wrong path). Change your approach.`;
         }

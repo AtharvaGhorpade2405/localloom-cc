@@ -92,3 +92,32 @@ describe('robust text tool calls (models without native tool calling)', () => {
     expect(unclosed.errors[0]).toMatch(/malformed or not closed/);
   });
 });
+
+describe('line-range edit blocks', () => {
+  it('parses <edit_file lines="a-b"> with only a <new> section', () => {
+    const { calls, errors } = parseTextToolCalls('<edit_file path="calc.py" lines="12-14">\n<new>\n    x = 1\n</new>\n</edit_file>', known);
+    expect(errors).toEqual([]);
+    expect(calls).toEqual([{ name: 'edit_file', arguments: { path: 'calc.py', new_string: '    x = 1', start_line: 12, end_line: 14 } }]);
+    const single = parseTextToolCalls('<edit_file path="a.py" lines="7"><new>y</new></edit_file>', known);
+    expect(single.calls[0]!.arguments).toMatchObject({ start_line: 7, end_line: 7 });
+  });
+  it('reports edit blocks that say neither which lines nor what text to replace', () => {
+    const { calls, errors } = parseTextToolCalls('<edit_file path="a.py"><new>y</new></edit_file>', known);
+    expect(calls).toEqual([]);
+    expect(errors[0]).toMatch(/lines="start-end"/);
+  });
+});
+
+describe('multi-edit ordering', () => {
+  it('applies several line-range edits of one reply bottom-up and drops duplicates', async () => {
+    const { orderEdits, dedupeCalls } = await import('../src/agents/runner.js');
+    const calls = [
+      { name: 'edit_file', arguments: { path: 'a.py', start_line: 2, end_line: 3, new_string: 'x' } },
+      { name: 'read_file', arguments: { path: 'b.py' } },
+      { name: 'edit_file', arguments: { path: 'a.py', start_line: 10, end_line: 10, new_string: 'y' } },
+      { name: 'edit_file', arguments: { path: 'a.py', start_line: 10, end_line: 10, new_string: 'y' } },
+    ];
+    const out = orderEdits(dedupeCalls(calls));
+    expect(out.map((c) => c.arguments.start_line ?? c.name)).toEqual([10, 'read_file', 2]);
+  });
+});

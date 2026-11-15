@@ -149,8 +149,35 @@ function ensureTrailingNewline(s: string): string {
 }
 
 const WRITE_BLOCK = /<write_file\s+path\s*=\s*["']([^"'\n]+)["']\s*>[ \t]*\r?\n?([\s\S]*?)<\/write_file>/g;
-const EDIT_BLOCK =
-  /<edit_file\s+path\s*=\s*["']([^"'\n]+)["']\s*>\s*<old>[ \t]*\r?\n?([\s\S]*?)\r?\n?<\/old>\s*<new>[ \t]*\r?\n?([\s\S]*?)\r?\n?<\/new>\s*<\/edit_file>/g;
+/** <edit_file path="…" [lines="12-15"]> [<old>…</old>] <new>…</new> </edit_file> */
+const EDIT_BLOCK = /<edit_file\s+([^>]*?)\s*>([\s\S]*?)<\/edit_file>/g;
+const OLD_PART = /<old>[ \t]*\r?\n?([\s\S]*?)\r?\n?<\/old>/;
+const NEW_PART = /<new>[ \t]*\r?\n?([\s\S]*?)\r?\n?<\/new>/;
+
+function attr(attrs: string, name: string): string | undefined {
+  const m = new RegExp(`${name}\\s*=\\s*["']([^"'\\n]*)["']`).exec(attrs);
+  return m?.[1];
+}
+
+function parseEditBlock(attrs: string, body: string): ToolCall | string {
+  const path = attr(attrs, 'path')?.trim();
+  if (!path) return '<edit_file> needs a path attribute: <edit_file path="file.py" lines="12-15">';
+  const neu = NEW_PART.exec(body);
+  if (!neu) return `<edit_file path="${path}"> needs a <new>…</new> section with the replacement lines.`;
+  const old = OLD_PART.exec(body);
+  const args: Record<string, unknown> = { path, new_string: unfence(neu[1]!) };
+  if (old) args.old_string = unfence(old[1]!);
+  const lines = attr(attrs, 'lines');
+  if (lines !== undefined) {
+    const m = /^\s*(\d+)\s*(?:-\s*(\d+))?\s*$/.exec(lines);
+    if (!m) return `Invalid lines="${lines}" in <edit_file path="${path}">; use lines="12-15" (or lines="12" for one line).`;
+    args.start_line = Number(m[1]);
+    args.end_line = Number(m[2] ?? m[1]);
+  } else if (!old) {
+    return `<edit_file path="${path}"> needs either lines="start-end" or an <old>…</old> section saying what to replace.`;
+  }
+  return { name: 'edit_file', arguments: args };
+}
 
 export interface ParsedText {
   calls: ToolCall[];
@@ -177,17 +204,16 @@ export function parseTextToolCalls(text: string, isKnownTool: (name: string) => 
     ranges.push([m.index!, m.index! + m[0].length]);
   }
   for (const m of text.matchAll(EDIT_BLOCK)) {
-    calls.push({
-      at: m.index!,
-      call: { name: 'edit_file', arguments: { path: m[1]!.trim(), old_string: unfence(m[2]!), new_string: unfence(m[3]!) } },
-    });
+    const parsed = parseEditBlock(m[1]!, m[2]!);
+    if (typeof parsed === 'string') errors.push(parsed);
+    else calls.push({ at: m.index!, call: parsed });
     ranges.push([m.index!, m.index! + m[0].length]);
   }
   const inRange = (pos: number) => ranges.some(([s, e]) => pos >= s && pos < e);
   const masked = ranges.reduce((t, [s, e]) => t.slice(0, s) + ' '.repeat(e - s) + t.slice(e), text);
   if (/<write_file\b/.test(masked) || /<edit_file\b/.test(masked)) {
     errors.push(
-      'A <write_file>/<edit_file> block was malformed or not closed. Use exactly: <write_file path="relative/path">…full content…</write_file>, or <edit_file path="…"><old>exact old text</old><new>replacement</new></edit_file>.',
+      'A <write_file>/<edit_file> block was malformed or not closed. Use exactly: <write_file path="relative/path">…full content…</write_file>, or <edit_file path="…" lines="12-15"><new>replacement lines</new></edit_file>.',
     );
   }
 
@@ -201,7 +227,7 @@ export function parseTextToolCalls(text: string, isKnownTool: (name: string) => 
         errors.push(
           `Your ${named[1]} call was not valid JSON, so it was NOT executed.` +
             (/write_file|edit_file/.test(named[1]!)
-              ? ' For file contents use the raw block format instead of JSON: <write_file path="file.py">…full content…</write_file>'
+              ? ' Use the raw block format instead of JSON: <edit_file path="file.py" lines="12-15"><new>…</new></edit_file> to change lines of an existing file, or <write_file path="new.py">…</write_file> for a new file.'
               : ' Escape quotes and newlines inside strings.'),
         );
         ranges.push([cand.start, cand.end]);
