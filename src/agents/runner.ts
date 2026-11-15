@@ -84,14 +84,37 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
   const isKnownTool = (name: string) => !!getTool(name);
 
   let system = agent.system;
+  const writes = agent.tools.includes('write_file');
+  const fileBlocks = `To create or overwrite a file, write this raw block in your reply (no JSON, no escaping — the code exactly as it should appear in the file):
+<write_file path="relative/path.py">
+...complete file content...
+</write_file>
+
+To change part of an existing file:
+<edit_file path="relative/path.py">
+<old>
+exact existing lines, copied character for character from read_file (without the line numbers)
+</old>
+<new>
+replacement lines
+</new>
+</edit_file>
+
+For files under about 200 lines it is usually easier and safer to rewrite the whole file with <write_file> than to edit it.`;
   if (!nativeTools) {
     system += `\n\n## Tools
 You can use these tools:
 ${toolDocs(agent.tools)}
 
-To call a tool, reply with ONLY a JSON object and nothing else, for example:
+To call a tool, reply with ONLY a JSON object, for example:
 {"name": "read_file", "arguments": {"path": "src/index.ts"}}
-Call one tool per reply. You will then receive the result. When you are finished, reply in plain text without any tool JSON.`;
+${writes ? `\n${fileBlocks}\n` : ''}
+Call one tool per reply. You will then receive the result. When you are finished, reply in plain text without any tool call.`;
+  } else if (writes) {
+    // Even tool-capable small models mangle code when they must escape it inside JSON arguments.
+    system += `\n\n## Writing code
+You may call write_file / edit_file, but for code the raw block format is more reliable:
+${fileBlocks}`;
   }
 
   const messages: ChatMessage[] = [
@@ -138,9 +161,11 @@ Call one tool per reply. You will then receive the result. When you are finished
     let calls = result.toolCalls;
     let prose = result.content;
     let textProtocol = false;
+    let parseErrors: string[] = [];
     if (!calls.length) {
       const parsed = parseTextToolCalls(result.content, isKnownTool);
-      if (parsed.calls.length) {
+      parseErrors = parsed.errors;
+      if (parsed.calls.length || parsed.errors.length) {
         calls = parsed.calls;
         prose = parsed.rest;
         textProtocol = true;
@@ -149,6 +174,16 @@ Call one tool per reply. You will then receive the result. When you are finished
     if (prose.trim()) {
       lastContent = prose;
       emit({ type: 'agent:message', agent: agent.role, model: model.name, content: prose });
+    }
+    if (parseErrors.length) {
+      emit({ type: 'notice', level: 'warn', text: `${agent.label}: malformed tool call — asking the model to retry.` });
+    }
+
+    if (!calls.length && parseErrors.length) {
+      // The model tried to call a tool but we could not understand it: tell it, never fail silently.
+      messages.push({ role: 'assistant', content: result.content });
+      messages.push({ role: 'user', content: `[tool error]\n${parseErrors.join('\n')}\nPlease try again.` });
+      continue;
     }
 
     if (!calls.length) {
@@ -197,7 +232,11 @@ Call one tool per reply. You will then receive the result. When you are finished
         const n = (failures.get(key) ?? 0) + 1;
         failures.set(key, n);
         if (n >= STUCK_LIMIT) stuckOutput = res.output;
-        else if (n >= 2) {
+        else if (n >= 2 && res.name === 'edit_file') {
+          output += `
+
+WARNING: edit_file has now failed ${n} times the same way. Stop using edit_file for this file. Rewrite the COMPLETE file with a <write_file path="..."> block (or write_file), keeping everything that already works.`;
+        } else if (n >= 2) {
           output += `\n\nWARNING: this exact failure has now happened ${n} times. Your previous fix did not work. Read the error message carefully and reconsider the root cause — it is often in a DIFFERENT file than the one you keep editing (e.g. a missing export, wrong import style, wrong path). Change your approach.`;
         }
       }
@@ -206,6 +245,9 @@ Call one tool per reply. You will then receive the result. When you are finished
       } else {
         messages.push({ role: 'tool', content: output, tool_name: res.name });
       }
+    }
+    if (parseErrors.length) {
+      messages.push({ role: 'user', content: `[tool error]\n${parseErrors.join('\n')}` });
     }
     if (stuckOutput !== undefined) {
       emit({
