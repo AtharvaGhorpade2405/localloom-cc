@@ -14,6 +14,12 @@ Inside the project folder the agents can freely read, create, edit and delete fi
 
 To work on an existing project in place instead, run `localloom --here` inside it.
 
+### Chat history
+
+Every conversation is saved automatically on your machine, so you can come back to it later. Type `/session` to open the list of saved chats (newest first), pick one with `↑/↓` and press `enter` to resume it: the transcript is shown again, the agents get the earlier context back, and they continue in that chat's project folder. `d` (pressed twice) deletes a chat. `/session 2` opens the second chat in the list directly, and `/session <id>` opens one by its id.
+
+Chats are stored only locally, one JSON file per chat, in `~/.localloom/sessions` (on Windows `C:\Users\<you>\.localloom\sessions`). Nothing is uploaded. Set `LOCALLOOM_HISTORY_DIR` to keep them somewhere else, or `LOCALLOOM_NO_HISTORY=1` to not save chats at all. `/clear` starts a new chat; the cleared one stays in the history.
+
 ### Coding on Groq (optional)
 
 Local models on a laptop GPU are slow at writing code. You can hand just the coding to [Groq](https://groq.com) while everything else stays local:
@@ -29,6 +35,7 @@ Note that the code the Coder reads and writes is sent to Groq. Without `--groq` 
 
 ## Features
 
+- **Local chat history**: every chat is saved on your machine and can be resumed with `/session`.
 - **Polished TUI** (React + Ink): streaming responses, live agent activity bar, tool execution feedback, model/mode indicators, command palette with completion, keyboard navigation.
 - **Local model selection**: auto-detects installed Ollama models. `/models` opens an interactive picker where you can assign a model to all agents or to each agent separately. You can switch models without restarting.
 - **Four-agent pipeline**: Planner → Coder → Reviewer ⇄ Fixer, with a review-and-fix loop that is capped at a set number of cycles (and scaled by task complexity). Questions that need no file changes are answered by the Planner directly.
@@ -70,6 +77,12 @@ npm install -g .
 
 After that, `localloom` works in any directory.
 
+Chat history needs no setup: the first time you send a message, LocalLoom creates `~/.localloom/sessions` and saves chats there. To store them elsewhere, set `LOCALLOOM_HISTORY_DIR` before starting:
+
+```bash
+export LOCALLOOM_HISTORY_DIR=~/localloom-chats   # PowerShell: $env:LOCALLOOM_HISTORY_DIR = "D:\localloom-chats"
+```
+
 ## Usage
 
 ```
@@ -93,9 +106,10 @@ localloom [options] [directory]
 | `/manual [name]` | Enable Manual mode |
 | `/groq [model]` | Toggle running the Coder and Fixer on Groq, or pick the Groq model |
 | `/new` | Start a new project folder with the next request |
+| `/session [n\|id]` | Browse saved chats and resume one (aliases `/sessions`, `/history`, `/resume`) |
 | `/agents` | Show agents, their models, tools and status |
 | `/approve` | Toggle auto-approval of commands and deletions |
-| `/clear` | Clear the screen and the in-memory conversation |
+| `/clear` | Clear the screen and start a new chat (the old one stays in the history) |
 | `/help` | Show commands and keys |
 | `/exit` | Exit |
 
@@ -103,7 +117,7 @@ localloom [options] [directory]
 
 `enter` sends · `tab` completes a command (or toggles Auto/Manual when the input is empty) · `↑/↓` history and lists · `esc` cancels the running task or closes dialogs · `ctrl+c` cancels, or exits when idle.
 
-In the model picker, `tab` / `←→` chooses which agent the model is assigned to.
+In the model picker, `tab` / `←→` chooses which agent the model is assigned to. In the chat history (`/session`), `enter` opens a chat and `d` twice deletes it.
 
 ### Environment variables
 
@@ -116,6 +130,8 @@ In the model picker, `tab` / `←→` chooses which agent the model is assigned 
 | `LOCALLOOM_MAX_REVIEW_CYCLES` | `3` | Upper limit on review→fix cycles |
 | `LOCALLOOM_COMMAND_TIMEOUT` | `120` | Command timeout (s) |
 | `LOCALLOOM_SHELL` | `cmd.exe` / `/bin/sh` | Shell for commands |
+| `LOCALLOOM_HISTORY_DIR` | `~/.localloom/sessions` | Folder where chats are saved (local only) |
+| `LOCALLOOM_NO_HISTORY` | unset | Set to `1` to not save chats |
 | `LOCALLOOM_DEBUG_LOG` | unset | Append every model request/response to this file (JSON lines), useful for diagnosing a model |
 
 ## How it works
@@ -128,7 +144,7 @@ user task ──► Router (Auto: SLM picks models per agent; Manual: your choic
           ──► Fixer     fixes reported issues ──► Reviewer … (≤ N cycles)
 ```
 
-State (conversation context, approvals, model choices) lives in memory only. Nothing is persisted.
+Approvals and model choices live in memory only. The conversation (transcript and the context the agents see) is saved to the local chat history after every change, so it can be resumed with `/session`; nothing is sent anywhere.
 
 ## Development
 
@@ -138,4 +154,4 @@ npm test           # vitest
 npm run typecheck
 ```
 
-Source layout: `src/ollama` (client, model profiling), `src/router` (Auto mode), `src/agents` (definitions, runner, tool-call parsing), `src/tools` (workspace sandbox, file tools, command safety), `src/core/session.ts` (orchestration), `src/ui` (Ink TUI), `src/cli.tsx` (entry point).
+Source layout: `src/ollama` (client, model profiling), `src/router` (Auto mode), `src/agents` (definitions, runner, tool-call parsing), `src/tools` (workspace sandbox, file tools, command safety), `src/core/session.ts` (orchestration), `src/core/history.ts` (local chat history), `src/ui` (Ink TUI), `src/cli.tsx` (entry point).
