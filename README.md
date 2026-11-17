@@ -1,11 +1,31 @@
 # LocalLoom
 
-**A fully local, multi-agent AI coding assistant for your terminal.** LocalLoom runs four specialised agents (Planner, Coder, Reviewer and Fixer) on models served by [Ollama](https://ollama.com). It works on the project in your current directory. No cloud APIs are involved; every model call stays on your machine.
+**A fully local, multi-agent AI coding assistant for your terminal.** LocalLoom runs four specialised agents (Planner, Coder, Reviewer and Fixer) on models served by [Ollama](https://ollama.com). No cloud APIs are involved; every model call stays on your machine.
 
 ```
-cd my-project
 localloom
 ```
+
+### Project folders
+
+LocalLoom creates a `LocalLoom Projects` folder in the directory it is started in. Each new project request ("make a calculator app…") gets its own folder there, named after the request (`calculator-app`; a taken name becomes `calculator-app (1)`). Follow-up requests keep working in the same folder; `/new` starts another one.
+
+Inside the project folder the agents can freely read, create, edit and delete files and create folders. They cannot leave it: file tools reject paths outside the folder, and commands that point outside it are refused. Commands that are not read-only still ask for approval.
+
+To work on an existing project in place instead, run `localloom --here` inside it.
+
+### Coding on Groq (optional)
+
+Local models on a laptop GPU are slow at writing code. You can hand just the coding to [Groq](https://groq.com) while everything else stays local:
+
+```bash
+export GROQ_API_KEY=gsk_...        # PowerShell: $env:GROQ_API_KEY = "gsk_..."
+localloom --groq                   # or --groq=llama-3.3-70b-versatile, or /groq inside the app
+```
+
+In Auto mode the Coder and Fixer then run on Groq (by default the best coding model Groq offers), while the router, Planner and Reviewer stay on your Ollama models. Groq models also appear in `/models` as `groq/<model>`, so in Manual mode you can assign them to any agent yourself.
+
+Note that the code the Coder reads and writes is sent to Groq. Without `--groq` (or `/groq`), nothing leaves your machine, even when `GROQ_API_KEY` is set. Rate limits are retried automatically; if Groq says a request is too large for your plan, lower `LOCALLOOM_GROQ_NUM_CTX`. Set `LOCALLOOM_GROQ_CODING=1` to turn Groq coding on at every start.
 
 ## Features
 
@@ -58,7 +78,9 @@ localloom [options] [directory]
   -m, --model <name>    Start in Manual mode with this model for all agents
   -a, --auto            Start in Auto mode (default)
   -p, --prompt <text>   Run a task immediately after start-up
-  -y, --yes             Auto-approve commands/deletions (dangerous commands stay blocked)
+      --here            Work directly in the directory instead of a project folder
+      --groq[=model]    Run the Coder and Fixer on Groq (needs GROQ_API_KEY)
+  -y, --yes             Auto-approve commands (dangerous commands stay blocked)
       --host <url>      Ollama URL (default $OLLAMA_HOST or http://127.0.0.1:11434)
 ```
 
@@ -69,6 +91,8 @@ localloom [options] [directory]
 | `/models [name]` | Open the model picker (or set a model directly) |
 | `/auto` | Enable Auto mode (SLM routing) |
 | `/manual [name]` | Enable Manual mode |
+| `/groq [model]` | Toggle running the Coder and Fixer on Groq, or pick the Groq model |
+| `/new` | Start a new project folder with the next request |
 | `/agents` | Show agents, their models, tools and status |
 | `/approve` | Toggle auto-approval of commands and deletions |
 | `/clear` | Clear the screen and the in-memory conversation |

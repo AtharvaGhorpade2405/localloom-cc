@@ -59,15 +59,23 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
         setConnected(true);
         setModelsError(undefined);
         const usable = usableModels(models);
+        if (!announce && session.groqError) notice('warn', `Groq models unavailable: ${session.groqError}`);
         if (!usable.length) {
           notice('warn', 'Ollama is running but no chat models are installed. Pull one, e.g. `ollama pull qwen2.5-coder:7b`, then run /models.');
         } else if (announce) {
+          const local = usable.filter((m) => !m.provider || m.provider === 'ollama');
+          const groqCount = usable.length - local.length;
           notice(
             'info',
             session.mode === 'auto'
-              ? `Auto mode · ${usable.length} local model${usable.length === 1 ? '' : 's'} available (${usable.map((m) => m.name).join(', ')})`
+              ? `Auto mode · ${local.length} local model${local.length === 1 ? '' : 's'} available (${local.map((m) => m.name).join(', ')})${groqCount ? ` + ${groqCount} Groq` : ''}`
               : `Manual mode · ${session.manualAssignment()?.coder}`,
           );
+          if (session.groqError) notice('warn', `Groq models unavailable: ${session.groqError}`);
+          if (session.groqCoding) {
+            const g = session.groqCoder();
+            notice(g ? 'info' : 'warn', g ? `Groq coding ON · Coder and Fixer → ${g.name} (code is sent to Groq) · /groq to turn off` : 'Groq coding is on, but no Groq model is available.');
+          }
         }
         rerender();
         return models;
@@ -187,6 +195,46 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
         case '/exit':
           abortRef.current?.abort();
           exit();
+          return;
+        case '/groq': {
+          if (!session.config.groqApiKey) {
+            notice('error', 'Groq is not set up. Set the GROQ_API_KEY environment variable and restart LocalLoom.');
+            return;
+          }
+          if (args) {
+            const want = args.replace(/^groq\//, '');
+            const m = session.groqModels.find((x) => x.name.toLowerCase() === `groq/${want.toLowerCase()}`);
+            if (!m) {
+              notice('error', `Groq has no model "${want}". Available: ${session.groqModels.map((x) => x.name.slice(5)).join(', ') || '(none — run /models to refresh)'}`);
+              return;
+            }
+            session.groqModel = want;
+            session.groqCoding = true;
+          } else {
+            session.groqCoding = !session.groqCoding;
+          }
+          if (session.groqCoding) {
+            const g = session.groqCoder();
+            if (session.mode !== 'auto') session.mode = 'auto';
+            notice(
+              g ? 'success' : 'warn',
+              g
+                ? `Groq coding ON · Auto mode, Coder and Fixer → ${g.name}; router, Planner and Reviewer stay local. The code the Coder works on is sent to Groq.`
+                : `Groq coding ON, but no Groq models are listed${session.groqError ? ` (${session.groqError})` : ''}. Run /models to refresh.`,
+            );
+          } else {
+            notice('success', 'Groq coding OFF · every agent runs on local models.');
+          }
+          rerender();
+          return;
+        }
+        case '/new':
+          if (!session.projectsRoot) {
+            notice('info', 'Started with --here: LocalLoom works directly in this directory, so there are no project folders.');
+            return;
+          }
+          session.newProject();
+          notice('success', 'Your next request will start a new project folder.');
           return;
         case '/agents':
           push({ kind: 'agents' });
@@ -326,6 +374,15 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
             assignment={assignment}
             mode={session.mode}
             error={modelsError}
+            groqNote={
+              !session.config.groqApiKey
+                ? 'Groq: no GROQ_API_KEY found. Set it, then start localloom again in a new terminal.'
+                : session.groqError
+                  ? `Groq: ${session.groqError}`
+                  : session.groqModels.length
+                    ? undefined
+                    : 'Groq: no chat models returned. Press r to refresh.'
+            }
             onClose={() => setOverlay(null)}
             onRefresh={() => void loadModels(false)}
             onAuto={() => {
@@ -351,6 +408,7 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
           mode={session.mode}
           modelLabel={modelLabel}
           autoApprove={session.policy.autoApprove}
+          groq={session.mode === 'auto' && session.groqCoding ? session.groqCoder()?.name ?? 'unavailable' : undefined}
           connected={connected}
           busy={state.busy}
         />

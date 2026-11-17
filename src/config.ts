@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 
 function intEnv(name: string, fallback: number): number {
@@ -28,6 +29,14 @@ export interface LocalLoomConfig {
   /** Shell used for run_command. */
   shell: string | true;
   platform: NodeJS.Platform;
+  /** Groq API key; when set, Groq models are offered next to local ones. */
+  groqApiKey?: string;
+  /** Preferred Groq model for coding (name without the "groq/" prefix). */
+  groqModel?: string;
+  /** Auto mode: send the Coder and Fixer to Groq (everything else stays local). */
+  groqCoding: boolean;
+  /** Context budget for Groq models (kept separate: free-tier token-per-minute limits are small). */
+  groqNumCtx: number;
 }
 
 export function normalizeHost(host: string): string {
@@ -49,8 +58,29 @@ export function loadConfig(overrides: Partial<LocalLoomConfig> = {}): LocalLoomC
     autoApprove: process.env.LOCALLOOM_AUTO_APPROVE === '1',
     shell: process.env.LOCALLOOM_SHELL || true,
     platform: os.platform(),
+    groqApiKey: process.env.GROQ_API_KEY?.trim() || undefined,
+    groqModel: process.env.LOCALLOOM_GROQ_MODEL?.trim().replace(/^groq\//, '') || undefined,
+    groqCoding: process.env.LOCALLOOM_GROQ_CODING === '1',
+    groqNumCtx: intEnv('LOCALLOOM_GROQ_NUM_CTX', intEnv('LOCALLOOM_NUM_CTX', 16384)),
   };
   return { ...base, ...overrides };
+}
+
+/**
+ * On Windows, a variable saved for the user account (System settings, or SetEnvironmentVariable)
+ * only reaches terminals opened afterwards. Read it from the registry so LocalLoom finds a key that
+ * was saved while this terminal was already open.
+ */
+export function savedUserEnv(name: string, platform: NodeJS.Platform = os.platform()): string | undefined {
+  if (platform !== 'win32') return undefined;
+  try {
+    const r = spawnSync('reg', ['query', 'HKCU\\Environment', '/v', name], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+    if (r.status !== 0) return undefined;
+    const m = new RegExp(`^\\s*${name}\\s+REG_(?:EXPAND_)?SZ\\s+(.*)$`, 'im').exec(r.stdout);
+    return m?.[1]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function describeShell(config: LocalLoomConfig): string {

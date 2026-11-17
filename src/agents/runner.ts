@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import type { LocalLoomConfig } from '../config.js';
 import { profileModel } from '../ollama/modelProfile.js';
-import type { ChatMessage, LLMClient, ModelInfo, ToolCall } from '../ollama/types.js';
+import { isRemote, type ChatMessage, type ChatResult, type LLMClient, type ModelInfo, type ToolCall } from '../ollama/types.js';
+import { isDegenerate } from './degenerate.js';
 import { executeTool, getTool, toolDocs, toolSpecs, type ToolContext } from '../tools/registry.js';
 import type { AgentDefinition } from './definitions.js';
 import type { EmitFn } from './events.js';
@@ -77,6 +80,25 @@ export function orderEdits(calls: ToolCall[]): ToolCall[] {
 
 /** Identical failures tolerated before an agent's turn is ended early. */
 export const STUCK_LIMIT = 4;
+/** Unusable replies in a row (garbled output, unparseable tool calls) before the turn is ended. */
+export const BAD_REPLY_LIMIT = 3;
+/** Failed write/edit attempts in a row (whatever the error) before the turn is ended. */
+export const FAILED_EDIT_LIMIT = 6;
+/** Times the exact same call may be made before the turn is ended. */
+export const REPEAT_LIMIT = 5;
+
+/** Identity of a file's current content, to notice when edits keep returning it to an earlier state. */
+function fileState(ctx: ToolContext, p: unknown): { key: string; rel: string } | undefined {
+  if (typeof p !== 'string') return undefined;
+  try {
+    const abs = ctx.workspace.resolve(p);
+    const rel = ctx.workspace.relative(abs);
+    const hash = createHash('sha1').update(fs.readFileSync(abs)).digest('hex');
+    return { key: `${rel}:${hash}`, rel };
+  } catch {
+    return undefined;
+  }
+}
 
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw new CancelledError();
@@ -111,7 +133,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<AgentRunResult> {
   const maxSteps = opts.maxSteps ?? config.maxAgentSteps;
   const profile = profileModel(model);
   const nativeTools = profile.tools;
-  const numCtx = Math.max(2048, Math.min(config.numCtx, model.contextLength || config.numCtx));
+  const ctxLimit = isRemote(model) ? config.groqNumCtx : config.numCtx;
+  const numCtx = Math.max(2048, Math.min(ctxLimit, model.contextLength || ctxLimit));
   const budgetChars = Math.floor(numCtx * 3);
   const isKnownTool = (name: string) => !!getTool(name);
 
@@ -141,10 +164,15 @@ To call a tool, reply with ONLY a JSON object, for example:
 {"name": "read_file", "arguments": {"path": "src/index.ts"}}
 ${writes ? `\n${fileBlocks}\n` : ''}
 Call one tool per reply. You will then receive the result. When you are finished, reply in plain text without any tool call.`;
+  } else if (writes && isRemote(model)) {
+    // Hosted APIs validate tool calls against the tools sent, so file tools stay native for them.
+    system += `\n\n## Writing code
+Create and change files with the write_file and edit_file tools. You may also write the block format below directly in your reply:
+${fileBlocks}`;
   } else if (writes) {
     // Even tool-capable small models mangle code when they must escape it inside JSON arguments.
     system += `\n\n## Writing code
-You may call the edit_file / write_file tools, or use the raw block format below, which is more reliable for code:
+To create or change files, do NOT use a tool call. Write the block format below directly in your reply (the user watches the file being written live). Use tool calls for everything else (reading, searching, commands).
 ${fileBlocks}`;
   }
 
@@ -157,45 +185,111 @@ ${fileBlocks}`;
   // Identical failing results (e.g. the same test error) signal the agent is going in circles.
   const failures = new Map<string, number>();
   let stuckOutput: string | undefined;
+  /** Set when the agent is clearly going in circles; ends the turn after the current reply. */
+  let loopReason: string | undefined;
   let nudges = 0;
   let lastContent = '';
 
-  const chatOnce = async (withTools: boolean) => {
+  // Local models write file content as streamed raw blocks, not native tool-call arguments: those
+  // arrive in one piece (nothing to show while the file is being written) and get mangled by JSON escaping.
+  // Hosted models (Groq) keep every tool: the API rejects calls to tools that were not sent, and large
+  // models escape JSON reliably.
+  const nativeSpecs = toolSpecs(isRemote(model) ? agent.tools : agent.tools.filter((t) => t !== 'write_file' && t !== 'edit_file'));
+  // A single reply never needs more than this; without a cap a runaway model generates until the context is full.
+  const numPredict = Math.max(1024, Math.min(8192, Math.floor(numCtx / 2)));
+
+  const chatOnce = async (withTools: boolean): Promise<ChatResult & { degenerate?: boolean }> => {
     throwIfAborted(signal);
     compactMessages(messages, budgetChars);
+    // Our own abort handle, so a reply that collapses into repetition can be cut off mid-stream.
+    const ac = new AbortController();
+    const onAbort = () => ac.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    let streamed = '';
+    let checkedAt = 0;
+    let degenerate = false;
     try {
-      return await client.chat(
+      const result = await client.chat(
         {
           model: model.name,
           messages,
-          tools: withTools && nativeTools ? toolSpecs(agent.tools) : undefined,
+          tools: withTools && nativeTools ? nativeSpecs : undefined,
           think: profile.thinking ? true : undefined,
-          options: { temperature: 0.2, num_ctx: numCtx },
+          options: { temperature: 0.2, num_ctx: numCtx, num_predict: numPredict },
           keepAlive: '10m',
         },
         {
-          onContent: (delta) => emit({ type: 'agent:content', agent: agent.role, delta }),
+          onContent: (delta) => {
+            streamed += delta;
+            if (!degenerate && streamed.length - checkedAt >= 400) {
+              checkedAt = streamed.length;
+              if (isDegenerate(streamed)) {
+                degenerate = true;
+                ac.abort();
+              }
+            }
+            emit({ type: 'agent:content', agent: agent.role, delta });
+          },
           onThinking: (delta) => emit({ type: 'agent:thinking', agent: agent.role, delta }),
         },
-        signal,
+        ac.signal,
       );
+      return { ...result, degenerate: degenerate || isDegenerate(result.content) };
     } catch (err) {
+      if (degenerate && !signal?.aborted) return { content: streamed, thinking: '', toolCalls: [], degenerate: true };
       if (signal?.aborted || (err as Error).name === 'AbortError') throw new CancelledError();
       throw err;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
     }
   };
+
+  /** End the turn early with an explanation, so the pipeline moves on instead of looping. */
+  const giveUp = (why: string, userHint = ''): AgentRunResult => {
+    emit({ type: 'notice', level: 'warn', text: `${agent.label} stopped: ${why}${userHint ? ` ${userHint}` : ''}` });
+    return {
+      content: `${lastContent ? `${lastContent}\n\n` : ''}I got stuck: ${why}`,
+      stats: { ...stats, stuck: true },
+    };
+  };
+  /** Replies in a row that could not be used at all (garbled, or tool calls that would not parse). */
+  let badReplies = 0;
+  /** Failed write/edit attempts since the last one that worked. */
+  let failedMutations = 0;
+  /** How often each file has been left in exactly the same state (an edit ↔ undo loop). */
+  const fileStates = new Map<string, number>();
+  const trackedFiles = new Set<string>();
 
   for (let step = 1; step <= maxSteps; step++) {
     stats.steps = step;
     emit({ type: 'agent:step', agent: agent.role, step, maxSteps });
     const result = await chatOnce(true);
+    if (result.degenerate) {
+      // Never feed the garbage back into the conversation: it only makes the next reply worse.
+      badReplies++;
+      if (badReplies >= BAD_REPLY_LIMIT) {
+        return giveUp(
+          `${model.name} kept producing garbled, repetitive output.`,
+          'The model may be too small for this task or its files may be damaged — try another model with /models, or re-download it (ollama rm, then ollama pull).',
+        );
+      }
+      emit({ type: 'notice', level: 'warn', text: `${agent.label}: the reply collapsed into repeated text and was cut off — retrying.` });
+      messages.push({
+        role: 'user',
+        content:
+          '[error] Your last reply degenerated into repeated or garbled text and was discarded. Answer again, and keep it short: one tool call or one file block.',
+      });
+      continue;
+    }
     let calls = result.toolCalls;
     let prose = result.content;
     let textProtocol = false;
     let parseErrors: string[] = [];
     if (!calls.length) {
       const parsed = parseTextToolCalls(result.content, isKnownTool);
-      parseErrors = parsed.errors;
+      // A tool call the API refused (e.g. Groq's validation) is reported back to the model like a malformed one.
+      parseErrors =
+        result.toolError && !parsed.calls.length ? [`Your tool call was rejected: ${result.toolError}`, ...parsed.errors] : parsed.errors;
       if (parsed.calls.length || parsed.errors.length) {
         calls = parsed.calls;
         prose = parsed.rest;
@@ -212,10 +306,19 @@ ${fileBlocks}`;
 
     if (!calls.length && parseErrors.length) {
       // The model tried to call a tool but we could not understand it: tell it, never fail silently.
-      messages.push({ role: 'assistant', content: result.content });
-      messages.push({ role: 'user', content: `[tool error]\n${parseErrors.join('\n')}\nPlease try again.` });
+      badReplies++;
+      if (badReplies >= BAD_REPLY_LIMIT) {
+        return giveUp(`${BAD_REPLY_LIMIT} replies in a row contained tool calls that could not be understood (${parseErrors[0]})`);
+      }
+      const cutOff =
+        result.doneReason === 'length'
+          ? '\nYour reply was cut off because it was too long. Write less per reply: one file, or one small edit, at a time.'
+          : '';
+      messages.push({ role: 'assistant', content: result.content.slice(0, 4000) });
+      messages.push({ role: 'user', content: `[tool error]\n${parseErrors.join('\n')}${cutOff}\nPlease try again.` });
       continue;
     }
+    badReplies = 0;
 
     if (!calls.length) {
       const nudge = opts.checkFinal?.(result.content, stats);
@@ -245,6 +348,12 @@ ${fileBlocks}`;
       const def = getTool(call.name);
       const detail = def ? def.describe(call.arguments) : '';
       emit({ type: 'tool:start', agent: agent.role, id, name: def?.name ?? call.name, detail });
+      if (def && (def.name === 'edit_file' || def.name === 'write_file')) {
+        // Remember what the file looked like before its first change, so "back to the original" counts as a repeat.
+        const before = fileState(toolContext, call.arguments.path ?? call.arguments.file_path);
+        if (before && !trackedFiles.has(before.rel)) fileStates.set(before.key, 1);
+        if (before) trackedFiles.add(before.rel);
+      }
       const sig = signature(call);
       const repeats = (seen.get(sig) ?? 0) + 1;
       seen.set(sig, repeats);
@@ -266,6 +375,30 @@ ${fileBlocks}`;
       let output = res.output;
       if (repeats >= 3) {
         output += `\n\nNote: you have made this exact call ${repeats} times. Do not repeat it — move on to the next step or finish.`;
+      }
+      if (repeats >= REPEAT_LIMIT) {
+        loopReason = `the exact same ${res.name} call was made ${repeats} times`;
+      }
+      const isFileChange = res.name === 'edit_file' || res.name === 'write_file';
+      if (isFileChange && !res.ok) {
+        failedMutations++;
+        if (failedMutations >= FAILED_EDIT_LIMIT) {
+          loopReason = `${failedMutations} attempts in a row to write or edit files failed (last error: ${res.summary})`;
+        }
+      } else if (isFileChange) {
+        failedMutations = 0;
+        // Edit ↔ undo loops: the file keeps coming back to a state it was already in.
+        const state = fileState(toolContext, res.args.path);
+        if (state) {
+          trackedFiles.add(state.rel);
+          const times = (fileStates.get(state.key) ?? 0) + 1;
+          fileStates.set(state.key, times);
+          if (times >= 3) {
+            loopReason = `${state.rel} was changed back and forth between the same versions ${times} times`;
+          } else if (times === 2) {
+            output += `\n\nNote: ${state.rel} is now exactly as it was after one of your earlier edits — you are undoing and redoing the same change. Only edit again if a DIFFERENT change is really needed; otherwise finish with a summary.`;
+          }
+        }
       }
       if (!res.ok) {
         // Ignore timings so "same error, different duration" still counts as the same failure.
@@ -290,6 +423,7 @@ WARNING: edit_file has now failed ${n} times the same way. Stop quoting old text
     if (parseErrors.length) {
       messages.push({ role: 'user', content: `[tool error]\n${parseErrors.join('\n')}` });
     }
+    if (loopReason && stuckOutput === undefined) return giveUp(loopReason);
     if (stuckOutput !== undefined) {
       emit({
         type: 'notice',

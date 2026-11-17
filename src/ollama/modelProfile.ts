@@ -1,4 +1,4 @@
-import type { ModelInfo } from './types.js';
+import { isRemote, type ModelInfo } from './types.js';
 
 /** Parse "7.6B", "770M", "1.5b" → billions. Falls back to a size hint in the model name (e.g. "llama3:8b"). */
 export function parseParamsB(parameterSize: string, name = ''): number {
@@ -74,6 +74,7 @@ export function formatBytes(bytes: number): string {
 export function describeModel(model: ModelInfo): string {
   const p = profileModel(model);
   const tags = [
+    isRemote(model) && `${model.provider} cloud`,
     p.coding && 'coding',
     p.reasoning && 'reasoning',
     p.tools && 'tools',

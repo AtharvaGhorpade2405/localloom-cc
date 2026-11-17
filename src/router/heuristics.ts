@@ -1,6 +1,6 @@
 import type { AgentRole } from '../agents/events.js';
 import { profileModel } from '../ollama/modelProfile.js';
-import type { ModelInfo } from '../ollama/types.js';
+import { isRemote, type ModelInfo } from '../ollama/types.js';
 
 export type Complexity = 'low' | 'medium' | 'high';
 
@@ -45,12 +45,25 @@ export function scoreModel(model: ModelInfo, role: AgentRole, complexity: Comple
   if (p.tools) score += role === 'planner' ? 1 : 2;
   // Larger context helps with real projects.
   if (model.contextLength >= 32768) score += 0.5;
-  // Efficiency: penalize large models for simple tasks, small ones for hard tasks.
+  // Efficiency: penalize large models for simple tasks, small ones for hard tasks. Hosted models cost
+  // no local time or memory, so only local ones are penalized for size.
+  if (isRemote(model)) return score;
   if (complexity === 'low') score -= Math.max(0, params - 8) * 0.25;
   if (complexity === 'medium') score -= Math.max(0, params - 34) * 0.1;
   if (complexity === 'high' && params < 3) score -= 3;
   if (params < 1) score -= 4; // sub-1B models are rarely good agents
   return score;
+}
+
+/** The best hosted Groq model for writing code (or the user's preferred one). */
+export function pickGroqCoder(models: ModelInfo[], preferred?: string): ModelInfo | undefined {
+  const remote = models.filter(isRemote);
+  if (preferred) {
+    const want = preferred.toLowerCase().replace(/^groq\//, '');
+    const m = remote.find((x) => x.name.toLowerCase() === `groq/${want}`);
+    if (m) return m;
+  }
+  return [...remote].sort((a, b) => scoreModel(b, 'coder', 'high') - scoreModel(a, 'coder', 'high'))[0];
 }
 
 export function heuristicAssignment(
@@ -62,13 +75,15 @@ export function heuristicAssignment(
   return { planner: pick('planner'), coder: pick('coder'), reviewer: pick('reviewer'), fixer: pick('fixer') };
 }
 
-/** The router itself should be small and fast: prefer the smallest capable model. */
-export function pickRouterModel(models: ModelInfo[], preferred?: string): ModelInfo {
+/** The router itself should be small and fast: always the smallest installed chat model. */
+export function pickRouterModel(all: ModelInfo[], preferred?: string): ModelInfo {
+  const local = all.filter((m) => !isRemote(m));
+  const models = local.length ? local : all;
   if (preferred) {
     const m = models.find((x) => x.name === preferred || x.name === `${preferred}:latest`);
     if (m) return m;
   }
-  const sized = [...models].sort((a, b) => (a.paramsB || a.sizeBytes / 0.6e9) - (b.paramsB || b.sizeBytes / 0.6e9));
-  // Avoid tiny sub-1B models that can't follow JSON instructions if something reasonable exists.
-  return sized.find((m) => (m.paramsB || 1) >= 1) ?? sized[0]!;
+  const size = (m: ModelInfo) => m.paramsB || m.sizeBytes / 0.6e9 || Number.MAX_VALUE;
+  // Ties (same parameter count) go to the smaller download, i.e. the faster quantization.
+  return [...models].sort((a, b) => size(a) - size(b) || a.sizeBytes - b.sizeBytes)[0]!;
 }

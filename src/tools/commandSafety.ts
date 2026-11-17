@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 /**
  * Classification of shell commands requested by agents.
  *  - blocked:  never executed (destructive / system-level / remote-code patterns)
@@ -54,6 +56,34 @@ const SAFE_PREFIXES: RegExp[] = [
 
 /** Shell metacharacters that could chain, redirect or substitute commands. */
 const CHAINING = /[;&|><`]|\$\(/;
+
+/**
+ * Best-effort check that a command stays inside the project folder: returns the first argument
+ * that points outside it (an absolute path elsewhere, `~`, or a `..` that climbs out), if any.
+ */
+export function pathOutsideWorkspace(command: string, root: string, platform: NodeJS.Platform = process.platform): string | undefined {
+  const win = platform === 'win32';
+  const p = win ? path.win32 : path.posix;
+  const inside = (abs: string) => {
+    const rel = p.relative(root, abs);
+    return rel === '' || (!rel.startsWith('..') && !p.isAbsolute(rel));
+  };
+  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s;&|<>()]+/g) ?? [];
+  // The first word is the program itself (often an absolute path to an interpreter), not a file argument.
+  for (const raw of tokens.slice(1)) {
+    const token = raw.replace(/^["']|["']$/g, '').replace(/^[\w-]+=/, '');
+    if (!token || token === '/dev/null' || /^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue; // URLs are not paths
+    if (/^~([\\/]|$)/.test(token) || /^%(USERPROFILE|HOMEPATH|APPDATA|LOCALAPPDATA|TEMP|TMP)%/i.test(token) || /^\$(HOME|env:)/i.test(token)) return token;
+    // On Windows a leading "/" is a switch (dir /s), not a path.
+    const absolute = win ? /^[a-z]:[\\/]|^\\\\/i.test(token) : token.startsWith('/');
+    if (absolute) {
+      if (!inside(p.resolve(token))) return token;
+    } else if (/(^|[\\/])\.\.([\\/]|$)/.test(token)) {
+      if (!inside(p.resolve(root, token))) return token;
+    }
+  }
+  return undefined;
+}
 
 export function assessCommand(command: string): CommandAssessment {
   const cmd = command.trim();
