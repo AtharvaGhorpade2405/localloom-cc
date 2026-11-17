@@ -75,7 +75,15 @@ export type Action =
   | { type: 'push'; item: NewChatItem }
   | { type: 'live'; text: string; thinking: string }
   | { type: 'busy'; busy: boolean }
-  | { type: 'clear' };
+  | { type: 'clear' }
+  | { type: 'load'; items: NewChatItem[] };
+
+/** Items that are part of the conversation (saved to history); views like /help are not. */
+const TRANSIENT_KINDS = new Set(['banner', 'help', 'agents', 'models']);
+
+export function persistableItems(items: ChatItem[]): NewChatItem[] {
+  return items.filter((i) => !TRANSIENT_KINDS.has(i.kind)).map(({ id: _id, ...rest }) => rest as NewChatItem);
+}
 
 /** Prose shown for a completed agent message (machine-readable JSON blocks removed). */
 export function displayText(agent: AgentRole, text: string): string {
@@ -94,6 +102,14 @@ export function reducer(state: UIState, action: Action): UIState {
       return { ...state, busy: action.busy };
     case 'clear':
       return { ...initialState(), items: [{ id: newId(), kind: 'banner' }], agents: state.busy ? state.agents : idleAgents() };
+    case 'load':
+      return {
+        ...initialState(),
+        items: [
+          { id: newId(), kind: 'banner' },
+          ...action.items.filter((i) => !TRANSIENT_KINDS.has(i.kind)).map((i) => ({ ...i, id: newId() }) as ChatItem),
+        ],
+      };
     case 'event':
       return applyEvent(state, action.event);
     default:

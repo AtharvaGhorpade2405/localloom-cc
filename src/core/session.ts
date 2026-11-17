@@ -37,9 +37,17 @@ export interface Review {
   raw: string;
 }
 
-interface MemoryEntry {
+export interface MemoryEntry {
   request: string;
   outcome: string;
+}
+
+/** The part of a Session that is saved with the chat history so a conversation can be resumed. */
+export interface SessionSnapshot {
+  memory: MemoryEntry[];
+  project?: ActiveProject;
+  /** The folder the agents were working in. */
+  workspaceRoot: string;
 }
 
 const ACTION_WORDS =
@@ -115,8 +123,8 @@ export interface ActiveProject {
 }
 
 /**
- * In-memory application state and the four-agent orchestration pipeline.
- * Nothing is persisted: state lives only for the duration of the process.
+ * Application state and the four-agent orchestration pipeline. The state lives in memory; the UI
+ * saves a snapshot of it (see `snapshot()`) to the local chat history so chats can be resumed.
  */
 export class Session {
   readonly client: LLMClient;
@@ -271,6 +279,45 @@ export class Session {
 
   get memorySize(): number {
     return this.memory.length;
+  }
+
+  snapshot(): SessionSnapshot {
+    return {
+      memory: this.memory.map((m) => ({ ...m })),
+      project: this.project ? { ...this.project } : undefined,
+      workspaceRoot: this.workspace.root,
+    };
+  }
+
+  /**
+   * Resume a saved conversation: restore its context and, when it still exists, its project folder.
+   * Returns a warning when the folder it worked in is gone.
+   */
+  restore(snap: SessionSnapshot): string | undefined {
+    this.memory = Array.isArray(snap.memory) ? snap.memory.map((m) => ({ request: String(m.request), outcome: String(m.outcome) })) : [];
+    this.startFresh = false;
+    if (!this.projectsRoot) {
+      // --here: the agents always work in the start directory.
+      return snap.workspaceRoot && path.resolve(snap.workspaceRoot) !== path.resolve(this.workspace.root)
+        ? `This chat worked in ${snap.workspaceRoot}; continuing in ${this.workspace.root}.`
+        : undefined;
+    }
+    const dir = snap.project?.dir;
+    if (snap.project && dir && fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      const real = fs.realpathSync(dir);
+      const rel = path.relative(this.projectsRoot, real);
+      if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+        this.project = { name: snap.project.name, dir: real };
+        this.workspace = new Workspace(real);
+        return undefined;
+      }
+      this.project = undefined;
+      this.workspace = new Workspace(this.projectsRoot);
+      return `This chat's project (${dir}) is outside the current projects folder; your next request will start a new project.`;
+    }
+    this.project = undefined;
+    this.workspace = new Workspace(this.projectsRoot);
+    return snap.project ? `The project folder ${snap.project.dir} no longer exists; your next request will start a new project.` : undefined;
   }
 
   private modelInfo(name: string): ModelInfo {
