@@ -10,9 +10,15 @@ import { ApprovalDialog } from './components/ApprovalDialog.js';
 import { MessageItem } from './components/MessageItem.js';
 import { ModelPicker } from './components/ModelPicker.js';
 import { PromptInput } from './components/PromptInput.js';
-import { initialState, reducer, type NewChatItem } from './state.js';
+import { SessionPicker } from './components/SessionPicker.js';
+import { HISTORY_VERSION, newSessionId, titleFor, type HistoryStore, type SessionSummary, type StoredItem } from '../core/history.js';
+import { initialState, persistableItems, reducer, type NewChatItem } from './state.js';
 
-type Overlay = { kind: 'models' } | { kind: 'approval'; request: ApprovalRequest } | null;
+type Overlay =
+  | { kind: 'models' }
+  | { kind: 'approval'; request: ApprovalRequest }
+  | { kind: 'sessions'; sessions: SessionSummary[] }
+  | null;
 
 function shortPath(p: string): string {
   const home = process.env.HOME || process.env.USERPROFILE;
@@ -21,7 +27,7 @@ function shortPath(p: string): string {
   return out;
 }
 
-export function App({ session, initialPrompt }: { session: Session; initialPrompt?: string }) {
+export function App({ session, initialPrompt, history }: { session: Session; initialPrompt?: string; history?: HistoryStore }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
@@ -37,6 +43,9 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
   const approvalRef = useRef<((d: ApprovalDecision) => void) | null>(null);
   const busyRef = useRef(false);
   busyRef.current = state.busy;
+  /** The saved chat this conversation is written to (a new file per conversation). */
+  const chatRef = useRef({ id: newSessionId(), createdAt: new Date().toISOString() });
+  const saveFailed = useRef(false);
 
   const push = useCallback((item: NewChatItem) => dispatch({ type: 'push', item }), []);
   const notice = useCallback(
@@ -89,6 +98,30 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
     },
     [session, notice],
   );
+
+  // Save the conversation to the local history whenever it changes (once it has a user message).
+  useEffect(() => {
+    if (!history) return;
+    const items = persistableItems(state.items) as unknown as StoredItem[];
+    if (!items.some((i) => i.kind === 'user')) return;
+    try {
+      history.save({
+        version: HISTORY_VERSION,
+        id: chatRef.current.id,
+        title: titleFor(items),
+        createdAt: chatRef.current.createdAt,
+        updatedAt: new Date().toISOString(),
+        cwd: process.cwd(),
+        mode: session.mode,
+        items,
+        ...session.snapshot(),
+      });
+      saveFailed.current = false;
+    } catch (err) {
+      if (!saveFailed.current) notice('warn', `Could not save chat history to ${history.dir}: ${(err as Error).message}`);
+      saveFailed.current = true;
+    }
+  }, [history, state.items, session, notice]);
 
   // Startup
   useEffect(() => {
@@ -186,9 +219,51 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
     rerender();
   }, [session, notice]);
 
+  const openSession = useCallback(
+    (id: string) => {
+      if (!history) return;
+      if (busyRef.current) {
+        notice('warn', 'Agents are still working. Press esc to cancel the current task before switching chats.');
+        return;
+      }
+      let record;
+      try {
+        record = history.load(id);
+      } catch (err) {
+        notice('error', `Could not open chat ${id}: ${(err as Error).message}`);
+        return;
+      }
+      setOverlay(null);
+      stdout.write('\x1b[2J\x1b[3J\x1b[H');
+      const warning = session.restore(record);
+      if (record.mode === 'auto' || record.mode === 'manual') session.mode = record.mode;
+      chatRef.current = { id: record.id, createdAt: record.createdAt };
+      dispatch({ type: 'load', items: record.items as unknown as NewChatItem[] });
+      setStaticKey((k) => k + 1);
+      notice('success', `Resumed chat “${record.title}” — new messages continue this conversation.`);
+      if (warning) notice('warn', warning);
+      rerender();
+    },
+    [history, notice, session, stdout],
+  );
+
   const runCommand = useCallback(
     (name: string, args: string) => {
       switch (name) {
+        case '/session': {
+          if (!history) {
+            notice('info', 'Chat history is turned off (LOCALLOOM_NO_HISTORY=1).');
+            return;
+          }
+          if (args) {
+            const found = history.resolve(args);
+            if (!found) notice('error', `No saved chat matches "${args}". Type /session to browse them.`);
+            else openSession(found.id);
+            return;
+          }
+          setOverlay({ kind: 'sessions', sessions: history.list() });
+          return;
+        }
         case '/help':
           push({ kind: 'help' });
           return;
@@ -242,6 +317,8 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
         case '/clear':
           stdout.write('\x1b[2J\x1b[3J\x1b[H');
           session.clearMemory();
+          // The cleared chat stays in the history; anything typed next is a new chat.
+          chatRef.current = { id: newSessionId(), createdAt: new Date().toISOString() };
           dispatch({ type: 'clear' });
           setStaticKey((k) => k + 1);
           return;
@@ -296,7 +373,7 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
           notice('error', `Unknown command ${name}. Type /help for the list of commands.`);
       }
     },
-    [exit, push, notice, session, stdout, loadModels],
+    [exit, push, notice, session, stdout, loadModels, history, openSession],
   );
 
   const handleSubmit = useCallback(
@@ -368,6 +445,20 @@ export function App({ session, initialPrompt }: { session: Session; initialPromp
           />
         ) : null}
         {overlay?.kind === 'approval' ? <ApprovalDialog request={overlay.request} onDecide={decide} /> : null}
+        {overlay?.kind === 'sessions' && history ? (
+          <SessionPicker
+            sessions={overlay.sessions}
+            currentId={chatRef.current.id}
+            dir={shortPath(history.dir)}
+            onOpen={openSession}
+            onClose={() => setOverlay(null)}
+            onDelete={(id) => {
+              history.delete(id);
+              if (id === chatRef.current.id) chatRef.current = { id: newSessionId(), createdAt: new Date().toISOString() };
+              setOverlay({ kind: 'sessions', sessions: history.list() });
+            }}
+          />
+        ) : null}
         {overlay?.kind === 'models' ? (
           <ModelPicker
             models={session.usable}

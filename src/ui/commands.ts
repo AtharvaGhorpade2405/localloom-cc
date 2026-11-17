@@ -11,6 +11,7 @@ export const COMMANDS: CommandInfo[] = [
   { name: '/groq', args: '[model]', description: 'Toggle running the Coder and Fixer on Groq (Auto mode), or pick the Groq model' },
   { name: '/manual', args: '[model]', description: 'Enable Manual mode — you choose the model' },
   { name: '/new', description: 'Start a new project folder with your next request' },
+  { name: '/session', args: '[n|id]', description: 'Browse saved chats and resume one (stored locally)', aliases: ['/sessions', '/history', '/resume'] },
   { name: '/agents', description: 'Show agent roles, assigned models and status' },
   { name: '/approve', description: 'Toggle auto-approval of commands' },
   { name: '/clear', description: 'Clear the screen and in-memory conversation context' },

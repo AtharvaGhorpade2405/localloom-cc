@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { render } from 'ink';
 import { APP_NAME, APP_VERSION, loadConfig, normalizeHost, savedUserEnv } from './config.js';
+import { defaultHistoryDir, historyDisabled, HistoryStore } from './core/history.js';
 import { PROJECTS_DIR_NAME } from './core/projects.js';
 import { Session } from './core/session.js';
 import { MultiClient } from './core/multiClient.js';
@@ -42,6 +43,8 @@ Environment:
   LOCALLOOM_MAX_REVIEW_CYCLES  Max review→fix cycles (default 3)
   LOCALLOOM_COMMAND_TIMEOUT    Command timeout in seconds (default 120)
   LOCALLOOM_SHELL              Shell used for commands (default: cmd.exe on Windows, /bin/sh elsewhere)
+  LOCALLOOM_HISTORY_DIR        Where chats are saved (default: ~/.localloom/sessions; local only)
+  LOCALLOOM_NO_HISTORY         Set to 1 to not save chats at all
 
 In the app, type /help for commands.`;
 
@@ -155,7 +158,8 @@ async function main() {
   }
   if (args.auto) session.mode = 'auto';
 
-  const instance = render(<App session={session} initialPrompt={args.prompt} />, { exitOnCtrlC: false });
+  const history = historyDisabled() ? undefined : new HistoryStore(defaultHistoryDir());
+  const instance = render(<App session={session} initialPrompt={args.prompt} history={history} />, { exitOnCtrlC: false });
   await instance.waitUntilExit();
   process.stdout.write('\nGoodbye from LocalLoom.\n');
   process.exit(0);
