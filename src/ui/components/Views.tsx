@@ -56,7 +56,7 @@ export function HelpView() {
       ))}
       <Box marginTop={1} />
       <Text color={theme.dim}>
-        Workflow: Planner → Coder → Reviewer ⇄ Fixer. All inference runs locally in Ollama. File access is limited to the current directory.
+        Workflow: Planner → Coder → Reviewer ⇄ Fixer. All inference runs locally in Ollama. Each project gets its own folder in "LocalLoom Projects"; agents cannot touch anything outside it.
       </Text>
     </Box>
   );

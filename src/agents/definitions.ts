@@ -11,10 +11,10 @@ export interface AgentDefinition {
 }
 
 const READ_TOOLS = ['list_dir', 'read_file', 'search_code', 'find_files'];
-const WRITE_TOOLS = [...READ_TOOLS, 'write_file', 'edit_file', 'delete_file', 'run_command'];
+const WRITE_TOOLS = [...READ_TOOLS, 'write_file', 'edit_file', 'delete_file', 'create_dir', 'run_command'];
 
 const COMMON = `You are part of LocalLoom, a local multi-agent coding assistant working inside the user's project.
-All paths are relative to the project root. You can only access files inside the project.
+All paths are relative to the project root. You can only access files inside the project folder: never use absolute paths or ".." to leave it. Inside it you may freely create folders and create, edit and delete files.
 Be precise and concise. Never invent file contents — read files before relying on them.
 Never run programs that do not exit on their own (GUI apps such as tkinter/pygame, web servers, programs waiting for input): they hang. LocalLoom automatically syntax-checks every file you change.`;
 

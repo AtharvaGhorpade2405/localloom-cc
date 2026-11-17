@@ -1,6 +1,7 @@
 import { Box, Text } from 'ink';
 import { AGENTS } from '../../agents/definitions.js';
 import { AGENT_ROLES, type AgentRole } from '../../agents/events.js';
+import { liveFileProgress } from '../liveFile.js';
 import type { AgentStatus, RunningTool } from '../state.js';
 import { SPINNER, agentColor, theme } from '../theme.js';
 
@@ -49,8 +50,19 @@ export function LivePanel({
   }
   if (!agent) return null;
   const trimmed = text.trimStart();
-  const isToolJson = /^(\{|\[|<tool_call>|```json\s*\{)/.test(trimmed);
-  const lines = isToolJson ? [] : wrapTail(text.trim(), Math.max(20, width - 4), maxLines);
+  // While the model streams a file block or a write/edit call, show the file growing instead of raw markup.
+  const file = liveFileProgress(text);
+  const isToolJson = !file && /^(\{|\[|<tool_call>|```json\s*\{)/.test(trimmed);
+  const lines = isToolJson || file ? [] : wrapTail(text.trim(), Math.max(20, width - 4), maxLines);
+  // One row per file line (long lines are cut, not wrapped) so the line numbers stay true.
+  const fileLines = file
+    ? file.content
+        .replace(/\n$/, '')
+        .split('\n')
+        .slice(-Math.max(3, maxLines - 1))
+        .map((l) => l.replace(/\t/g, '  ').slice(0, Math.max(20, width - 11)))
+    : [];
+  const firstLineNo = file ? Math.max(1, file.lines - fileLines.length + 1) : 1;
   const a = AGENTS[agent];
   return (
     <Box flexDirection="column" marginTop={1}>
@@ -65,6 +77,24 @@ export function LivePanel({
           <Text color={theme.dim} italic>
             thinking… {thinking.replace(/\s+/g, ' ').slice(-Math.max(20, width - 16))}
           </Text>
+        </Box>
+      ) : null}
+      {file ? (
+        <Box paddingLeft={2} flexDirection="column">
+          <Text>
+            <Text color={theme.warn}>{file.complete ? '✓' : spin}</Text>
+            <Text color={agentColor[agent]}> {file.action}</Text>
+            <Text bold> {file.path}</Text>
+            <Text color={theme.dim}>
+              {file.range ? ` · lines ${file.range}` : ''} · {file.lines} line{file.lines === 1 ? '' : 's'} {file.complete ? 'ready' : 'so far'}
+            </Text>
+          </Text>
+          {fileLines.map((l, i) => (
+            <Text key={i}>
+              <Text color={theme.dim}>{String(firstLineNo + i).padStart(4)} │ </Text>
+              <Text>{l || ' '}</Text>
+            </Text>
+          ))}
         </Box>
       ) : null}
       {isToolJson ? (
@@ -164,6 +194,7 @@ export function StatusBar({
   autoApprove,
   connected,
   busy,
+  groq,
 }: {
   cwd: string;
   mode: 'auto' | 'manual';
@@ -171,6 +202,8 @@ export function StatusBar({
   autoApprove: boolean;
   connected: boolean | undefined;
   busy: boolean;
+  /** Groq model used for coding, when Groq coding is on. */
+  groq?: string;
 }) {
   return (
     <Box justifyContent="space-between" paddingX={1}>
@@ -180,6 +213,7 @@ export function StatusBar({
         </Text>
         <Text> </Text>
         <Text color={theme.text}>{modelLabel}</Text>
+        {groq ? <Text color={theme.brand2}> · coding on {groq}</Text> : null}
         {autoApprove ? <Text color={theme.warn}> · auto-approve</Text> : null}
         <Text color={theme.dim}> · </Text>
         <Text color={connected === false ? theme.error : connected ? theme.success : theme.dim}>

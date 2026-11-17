@@ -13,7 +13,7 @@ import {
 import { parseParamsB } from './modelProfile.js';
 
 /** When LOCALLOOM_DEBUG_LOG is set, append every model exchange to that file (JSON lines). */
-function debugLog(request: ChatRequest, result: ChatResult): void {
+export function debugLog(request: ChatRequest, result: ChatResult): void {
   const file = process.env.LOCALLOOM_DEBUG_LOG;
   if (!file) return;
   try {

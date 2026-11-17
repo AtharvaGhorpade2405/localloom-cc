@@ -43,7 +43,7 @@ export class FakeClient implements LLMClient {
     const r = this.responder(req, this.calls.length - 1);
     const content = r.content ?? '';
     for (const piece of content.match(/\S+\s*/g) ?? []) handlers.onContent?.(piece);
-    return { content, thinking: '', toolCalls: r.toolCalls ?? [] };
+    return { ...r, content, thinking: '', toolCalls: r.toolCalls ?? [] };
   }
 }
 

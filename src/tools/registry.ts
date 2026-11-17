@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import type { LocalLoomConfig } from '../config.js';
 import type { ToolSpec } from '../ollama/types.js';
-import { assessCommand } from './commandSafety.js';
+import fs from 'node:fs';
+import { assessCommand, pathOutsideWorkspace } from './commandSafety.js';
 import { deleteFile, editFile, editLines, findFiles, listDir, readFile, searchCode, snippetAround, writeFile } from './fsTools.js';
 import { runShellCommand } from './runCommand.js';
 import { checkFile, detectNeverExiting } from './verify.js';
@@ -39,6 +40,11 @@ export interface ToolContext {
   requestApproval: (req: ApprovalRequest) => Promise<ApprovalDecision>;
   /** Allow write_file to overwrite files that existed before the task (only when the user asked for a rewrite). */
   allowOverwrite?: boolean;
+  /**
+   * The workspace is a LocalLoom project folder: agents may delete files in it without asking,
+   * and commands that point outside it are refused.
+   */
+  confined?: boolean;
 }
 
 export interface ToolOutput {
@@ -226,7 +232,7 @@ export const TOOLS: ToolDefinition[] = [
   }),
   defineTool({
     name: 'delete_file',
-    description: 'Delete a single file from the project. Requires user approval.',
+    description: 'Delete a single file from the project.',
     schema: z.object({ path: z.string().describe('File path relative to the project root') }),
     readOnly: false,
     describe: (a) => str(a.path),
@@ -234,7 +240,7 @@ export const TOOLS: ToolDefinition[] = [
       const abs = ctx.workspace.resolveWritable(a.path);
       const rel = ctx.workspace.relative(abs);
       const key = `delete:${rel}`;
-      if (!ctx.policy.isAllowed(key)) {
+      if (!ctx.confined && !ctx.policy.isAllowed(key)) {
         const decision = await ctx.requestApproval({
           kind: 'delete',
           title: `Delete file ${rel}?`,
@@ -248,6 +254,23 @@ export const TOOLS: ToolDefinition[] = [
       }
       deleteFile(ctx.workspace, a.path);
       return { ok: true, output: `Deleted ${rel}.`, summary: 'deleted' };
+    },
+  }),
+  defineTool({
+    name: 'create_dir',
+    description: 'Create a folder inside the project (parent folders are created automatically). write_file also creates missing folders, so this is only needed for empty folders.',
+    schema: z.object({ path: z.string().describe('Folder path relative to the project root') }),
+    readOnly: false,
+    describe: (a) => str(a.path),
+    run: async (a, ctx) => {
+      const abs = ctx.workspace.resolveWritable(a.path);
+      const rel = ctx.workspace.relative(abs);
+      if (fs.existsSync(abs)) {
+        if (fs.statSync(abs).isDirectory()) return { ok: true, output: `Folder ${rel} already exists.`, summary: 'already exists' };
+        throw new Error(`${rel} already exists and is a file`);
+      }
+      fs.mkdirSync(abs, { recursive: true });
+      return { ok: true, output: `Created folder ${rel}.`, summary: 'created' };
     },
   }),
   defineTool({
@@ -268,6 +291,16 @@ export const TOOLS: ToolDefinition[] = [
           output: `Command blocked by LocalLoom safety policy (${assessment.reason}). Do not attempt it again or work around it.`,
           summary: `blocked: ${assessment.reason}`,
         };
+      }
+      if (ctx.confined) {
+        const outside = pathOutsideWorkspace(a.command, ctx.workspace.root);
+        if (outside) {
+          return {
+            ok: false,
+            output: `Command blocked: "${outside}" is outside the project folder. You may only work inside the project; use paths relative to the project root. Do not attempt it again or work around it.`,
+            summary: 'blocked: path outside the project',
+          };
+        }
       }
       const hang = detectNeverExiting(a.command, ctx.workspace);
       if (hang) {
@@ -337,6 +370,10 @@ const TOOL_ALIASES: Record<string, string> = {
   search_files: 'search_code',
   glob: 'find_files',
   create_file: 'write_file',
+  mkdir: 'create_dir',
+  make_dir: 'create_dir',
+  create_directory: 'create_dir',
+  create_folder: 'create_dir',
   save_file: 'write_file',
   replace_in_file: 'edit_file',
   str_replace: 'edit_file',

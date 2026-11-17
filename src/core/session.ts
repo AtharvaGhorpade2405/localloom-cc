@@ -1,16 +1,19 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { AGENTS } from '../agents/definitions.js';
 import { AGENT_ROLES, type AgentRole, type EmitFn } from '../agents/events.js';
 import { CancelledError, runAgent } from '../agents/runner.js';
 import { extractTrailingJson, stripTrailingJsonBlock } from '../agents/toolParse.js';
 import { describeShell, type LocalLoomConfig } from '../config.js';
 import { resolveModelName, usableModels } from '../ollama/modelProfile.js';
-import type { LLMClient, ModelInfo } from '../ollama/types.js';
-import { estimateComplexity, heuristicAssignment, type Complexity } from '../router/heuristics.js';
+import { isRemote, type LLMClient, type ModelInfo } from '../ollama/types.js';
+import { estimateComplexity, heuristicAssignment, pickGroqCoder, type Complexity } from '../router/heuristics.js';
 import { routeTask, type Assignment, type RoutingResult } from '../router/router.js';
 import { listDir } from '../tools/fsTools.js';
 import { ApprovalPolicy, type ApprovalDecision, type ApprovalRequest, type ToolContext } from '../tools/registry.js';
 import { formatReport, verifyChanges } from '../tools/verify.js';
 import { Workspace } from '../tools/workspace.js';
+import { createProjectDir, looksLikeNewProject, projectNameFor, removeIfEmpty } from './projects.js';
 
 export type Mode = 'auto' | 'manual';
 
@@ -99,6 +102,16 @@ export interface SessionDeps {
   client: LLMClient;
   config: LocalLoomConfig;
   cwd: string;
+  /**
+   * When set, every new project request gets its own folder inside this directory and the agents
+   * are confined to it. When omitted, the agents work directly in `cwd` (edit an existing project).
+   */
+  projectsRoot?: string;
+}
+
+export interface ActiveProject {
+  name: string;
+  dir: string;
 }
 
 /**
@@ -108,7 +121,15 @@ export interface SessionDeps {
 export class Session {
   readonly client: LLMClient;
   readonly config: LocalLoomConfig;
-  readonly workspace: Workspace;
+  /** Where the agents may work right now: the active project folder (or `cwd` without project folders). */
+  workspace: Workspace;
+  readonly projectsRoot?: string;
+  project?: ActiveProject;
+  private startFresh = false;
+  /** Auto mode: the Coder and Fixer run on Groq; the router, Planner and Reviewer stay local. */
+  groqCoding: boolean;
+  /** Preferred Groq model for coding (without the "groq/" prefix). */
+  groqModel?: string;
   readonly policy: ApprovalPolicy;
   models: ModelInfo[] = [];
   mode: Mode = 'auto';
@@ -119,8 +140,16 @@ export class Session {
   constructor(deps: SessionDeps) {
     this.client = deps.client;
     this.config = deps.config;
-    this.workspace = new Workspace(deps.cwd);
+    if (deps.projectsRoot) {
+      fs.mkdirSync(deps.projectsRoot, { recursive: true });
+      this.projectsRoot = fs.realpathSync(deps.projectsRoot);
+      this.workspace = new Workspace(this.projectsRoot);
+    } else {
+      this.workspace = new Workspace(deps.cwd);
+    }
     this.policy = new ApprovalPolicy(deps.config.autoApprove);
+    this.groqCoding = deps.config.groqCoding;
+    this.groqModel = deps.config.groqModel;
   }
 
   async refreshModels(): Promise<ModelInfo[]> {
@@ -137,11 +166,27 @@ export class Session {
     return usableModels(this.models);
   }
 
-  /** Default model for manual mode: the best general coding model available. */
+  /** Hosted Groq models currently offered. */
+  get groqModels(): ModelInfo[] {
+    return this.usable.filter(isRemote);
+  }
+
+  /** Why Groq models could not be listed (missing key is not an error). */
+  get groqError(): string | undefined {
+    return (this.client as { remoteError?: string }).remoteError;
+  }
+
+  /** The Groq model the Coder and Fixer use when Groq coding is on. */
+  groqCoder(): ModelInfo | undefined {
+    return pickGroqCoder(this.usable, this.groqModel);
+  }
+
+  /** Default model for manual mode: the best local coding model (a hosted one only if nothing is local). */
   defaultModel(): string | undefined {
     const u = this.usable;
     if (!u.length) return undefined;
-    return heuristicAssignment(u, 'medium').coder;
+    const local = u.filter((m) => !isRemote(m));
+    return heuristicAssignment(local.length ? local : u, 'medium').coder;
   }
 
   setManualModel(name: string, role: AgentRole | 'all' = 'all'): ModelInfo {
@@ -165,6 +210,59 @@ export class Session {
   currentAssignment(): Partial<Assignment> {
     if (this.mode === 'manual') return this.manualAssignment() ?? {};
     return this.lastRouting?.assignment ?? {};
+  }
+
+  /** Make the next request start a new project folder instead of continuing the current one. */
+  newProject(): void {
+    this.startFresh = true;
+  }
+
+  /**
+   * Pick the folder this task works in: continue the active project, or create a new one when
+   * there is none, the user asked for one (/new) or the request describes a brand-new project.
+   */
+  private prepareProject(task: string, emit: EmitFn): boolean {
+    if (!this.projectsRoot) return false;
+    const current = this.project;
+    if (current && fs.existsSync(current.dir) && !this.startFresh && !looksLikeNewProject(task)) {
+      emit({ type: 'notice', level: 'info', text: `Project · ${current.name} (continuing — /new starts another one)` });
+      return false;
+    }
+    this.startFresh = false;
+    const created = createProjectDir(this.projectsRoot, projectNameFor(task));
+    this.project = created;
+    this.workspace = new Workspace(created.dir);
+    this.memory = [];
+    emit({
+      type: 'notice',
+      level: 'success',
+      text: `New project · ${path.join(path.basename(this.projectsRoot), created.name)} — agents can read, write, edit and delete only inside this folder`,
+    });
+    return true;
+  }
+
+  /** A project folder that received nothing (e.g. the request was only a question) is not kept. */
+  private discardEmptyProject(): void {
+    if (!this.projectsRoot || !this.project) return;
+    if (removeIfEmpty(this.project.dir)) {
+      this.project = undefined;
+      this.workspace = new Workspace(this.projectsRoot);
+    }
+  }
+
+  /** Auto mode with Groq coding on: hand the Coder and Fixer to the best (or chosen) Groq model. */
+  private withGroqCoding(routing: RoutingResult, emit: EmitFn): RoutingResult {
+    const groq = this.groqCoder();
+    if (!groq) {
+      const why = this.groqError ?? (this.config.groqApiKey ? 'Groq returned no chat models' : 'GROQ_API_KEY is not set');
+      emit({ type: 'notice', level: 'warn', text: `Groq coding is on, but no Groq model is available (${why}). Using local models for every agent.` });
+      return routing;
+    }
+    return {
+      ...routing,
+      assignment: { ...routing.assignment, coder: groq.name, fixer: groq.name },
+      reasoning: `${routing.reasoning} Coder and Fixer run on Groq (${groq.name}); the rest stays local.`,
+    };
   }
 
   clearMemory(): void {
@@ -211,6 +309,15 @@ export class Session {
     signal?: AbortSignal,
   ): Promise<void> {
     emit({ type: 'task:start', task });
+    let createdProject = false;
+    try {
+      createdProject = this.prepareProject(task, emit);
+    } catch (err) {
+      const message = `Could not create the project folder: ${(err as Error).message}`;
+      emit({ type: 'notice', level: 'error', text: message });
+      emit({ type: 'task:end', status: 'error', summary: message, changedFiles: [] });
+      return;
+    }
     this.workspace.resetChanges();
     const toolContext: ToolContext = {
       workspace: this.workspace,
@@ -220,6 +327,8 @@ export class Session {
       requestApproval,
       // Existing files are edited in place; whole-file rewrites only when the user asks for one.
       allowOverwrite: REWRITE_WORDS.test(task),
+      // Inside a LocalLoom project folder the agents have full file permissions, and nothing outside it.
+      confined: !!this.projectsRoot,
     };
     const run = (role: AgentRole, model: string, prompt: string, extra: Partial<Parameters<typeof runAgent>[0]> = {}, label?: string) => {
       emit({ type: 'agent:start', agent: role, model, label });
@@ -255,6 +364,7 @@ export class Session {
           corrected: [],
         };
       }
+      if (this.mode === 'auto' && this.groqCoding) routing = this.withGroqCoding(routing, emit);
       this.lastRouting = routing;
       emit({ type: 'routing', result: routing });
       const A = routing.assignment;
@@ -276,6 +386,7 @@ export class Session {
         }
         const answer = stripTrailingJsonBlock(planRun.content, 'needs_changes');
         this.memory.push({ request: task, outcome: answer.slice(0, 600) });
+        if (createdProject) this.discardEmptyProject();
         emit({ type: 'task:end', status: 'done', summary: 'Answered by the Planner — no changes needed.', changedFiles: [] });
         return;
       }

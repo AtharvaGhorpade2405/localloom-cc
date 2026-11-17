@@ -8,9 +8,11 @@ export interface CommandInfo {
 export const COMMANDS: CommandInfo[] = [
   { name: '/models', args: '[model]', description: 'View and select installed Ollama models' },
   { name: '/auto', description: 'Enable Auto mode — a local SLM routes models to agents' },
+  { name: '/groq', args: '[model]', description: 'Toggle running the Coder and Fixer on Groq (Auto mode), or pick the Groq model' },
   { name: '/manual', args: '[model]', description: 'Enable Manual mode — you choose the model' },
+  { name: '/new', description: 'Start a new project folder with your next request' },
   { name: '/agents', description: 'Show agent roles, assigned models and status' },
-  { name: '/approve', description: 'Toggle auto-approval of commands and file deletions' },
+  { name: '/approve', description: 'Toggle auto-approval of commands' },
   { name: '/clear', description: 'Clear the screen and in-memory conversation context' },
   { name: '/help', description: 'Show commands and keyboard shortcuts' },
   { name: '/exit', description: 'Exit LocalLoom', aliases: ['/quit', '/q'] },

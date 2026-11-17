@@ -70,6 +70,13 @@ export interface ModelInfo {
   quantization: string;
   contextLength: number;
   capabilities: string[];
+  /** Where the model runs. Undefined means a local Ollama model. */
+  provider?: 'ollama' | 'groq';
+}
+
+/** True for models that run on a remote API (code and prompts leave the machine). */
+export function isRemote(model: ModelInfo): boolean {
+  return !!model.provider && model.provider !== 'ollama';
 }
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
@@ -112,6 +119,8 @@ export interface ChatResult {
   thinking: string;
   toolCalls: ToolCall[];
   doneReason?: string;
+  /** The backend refused the model's tool call (the reply carries no usable call). */
+  toolError?: string;
   promptTokens?: number;
   outputTokens?: number;
 }

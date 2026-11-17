@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { AGENT_ROLES, type AgentRole } from '../agents/events.js';
 import { extractTrailingJson } from '../agents/toolParse.js';
 import { describeModel, formatBytes, resolveModelName, usableModels } from '../ollama/modelProfile.js';
-import type { LLMClient, ModelInfo } from '../ollama/types.js';
+import { isRemote, type LLMClient, type ModelInfo } from '../ollama/types.js';
 import { estimateComplexity, heuristicAssignment, pickRouterModel, type Complexity } from './heuristics.js';
 
 export type Assignment = Record<AgentRole, string>;
@@ -87,7 +87,10 @@ export async function routeTask(
   installed: ModelInfo[],
   opts: RouteOptions = {},
 ): Promise<RoutingResult> {
-  const models = usableModels(installed);
+  // The router only spreads LOCAL models over the agents; hosted models are added by the session on request.
+  const usable = usableModels(installed);
+  const localOnly = usable.filter((m) => !isRemote(m));
+  const models = localOnly.length ? localOnly : usable;
   if (!models.length) throw new Error('No usable chat models are installed in Ollama. Pull one with `ollama pull qwen2.5-coder:7b`.');
   const hint = estimateComplexity(task);
   const fallback = heuristicAssignment(models, hint);

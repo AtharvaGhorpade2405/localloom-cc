@@ -14,13 +14,15 @@ interface Props {
   assignment: Partial<Record<AgentRole, string>>;
   mode: 'auto' | 'manual';
   error?: string;
+  /** Why no Groq models are listed, if they are missing. */
+  groqNote?: string;
   onSelect: (model: string, target: Target) => void;
   onAuto: () => void;
   onRefresh: () => void;
   onClose: () => void;
 }
 
-export function ModelPicker({ models, assignment, mode, error, onSelect, onAuto, onRefresh, onClose }: Props) {
+export function ModelPicker({ models, assignment, mode, error, groqNote, onSelect, onAuto, onRefresh, onClose }: Props) {
   // Row 0 is "Auto mode", then one row per model.
   const initial = Math.max(0, models.findIndex((m) => m.name === assignment.coder) + 1);
   const [idx, setIdx] = useState(mode === 'auto' ? 0 : initial);
@@ -67,6 +69,7 @@ export function ModelPicker({ models, assignment, mode, error, onSelect, onAuto,
         ))}
       </Text>
       {error ? <Text color={theme.error}>{error}</Text> : null}
+      {groqNote ? <Text color={theme.warn}>{groqNote}</Text> : null}
       <Box marginTop={1} flexDirection="column">
         <Text color={idx === 0 ? theme.accent : theme.text} bold={idx === 0}>
           {idx === 0 ? '▸ ' : '  '}⚡ Auto mode <Text color={theme.dim}>— a local SLM picks the best model for each agent</Text>

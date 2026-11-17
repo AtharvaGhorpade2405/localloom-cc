@@ -2,8 +2,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { render } from 'ink';
-import { APP_NAME, APP_VERSION, loadConfig, normalizeHost } from './config.js';
+import { APP_NAME, APP_VERSION, loadConfig, normalizeHost, savedUserEnv } from './config.js';
+import { PROJECTS_DIR_NAME } from './core/projects.js';
 import { Session } from './core/session.js';
+import { MultiClient } from './core/multiClient.js';
+import { GroqClient } from './groq/client.js';
 import { OllamaClient } from './ollama/client.js';
 import { App } from './ui/App.js';
 
@@ -12,19 +15,27 @@ const HELP = `${APP_NAME} v${APP_VERSION} — local multi-agent AI coding assist
 Usage:
   localloom [options] [directory]
 
-Runs in the current directory (or [directory]) and uses it as the project workspace.
+Creates a "LocalLoom Projects" folder in the current directory (or [directory]). Every new project
+request gets its own folder inside it, and the agents can only read, write, edit and delete there.
 
 Options:
   -m, --model <name>    Start in Manual mode with this Ollama model for all agents
   -a, --auto            Start in Auto mode (default)
   -p, --prompt <text>   Run this task immediately after start-up
-  -y, --yes             Auto-approve commands and deletions (dangerous commands stay blocked)
+      --here            Work directly in the directory instead (edit an existing project in place)
+  -y, --yes             Auto-approve commands (dangerous commands stay blocked)
+      --groq[=model]    Auto mode: run the Coder and Fixer on Groq (needs GROQ_API_KEY); the rest stays local
       --host <url>      Ollama server URL (default: $OLLAMA_HOST or http://127.0.0.1:11434)
   -h, --help            Show this help
   -v, --version         Show version
 
 Environment:
   OLLAMA_HOST                  Ollama server address
+  GROQ_API_KEY                 Enables Groq models (listed as groq/<model> next to local ones)
+  LOCALLOOM_GROQ_CODING        Set to 1 to always run the Coder and Fixer on Groq in Auto mode
+  LOCALLOOM_GROQ_MODEL         Groq model for coding (default: the best coding model Groq offers)
+  LOCALLOOM_GROQ_NUM_CTX       Context budget for Groq models (default: LOCALLOOM_NUM_CTX)
+  LOCALLOOM_PROJECTS_DIR       Where project folders are created (default: ./LocalLoom Projects)
   LOCALLOOM_ROUTER_MODEL       Model used by the Auto-mode router (default: smallest installed)
   LOCALLOOM_NUM_CTX            Context window requested from Ollama (default 16384)
   LOCALLOOM_MAX_STEPS          Max tool steps per agent turn (default 24)
@@ -39,6 +50,9 @@ interface CliArgs {
   auto?: boolean;
   prompt?: string;
   yes?: boolean;
+  here?: boolean;
+  groq?: boolean;
+  groqModel?: string;
   host?: string;
   dir?: string;
 }
@@ -77,10 +91,21 @@ function parseArgs(argv: string[]): CliArgs {
       case '--yes':
         out.yes = true;
         break;
+      case '--here':
+        out.here = true;
+        break;
+      case '--groq':
+        out.groq = true;
+        break;
       case '--host':
         out.host = next();
         break;
       default:
+        if (a.startsWith('--groq=')) {
+          out.groq = true;
+          out.groqModel = a.slice('--groq='.length);
+          break;
+        }
         if (a.startsWith('-')) fail(`Unknown option: ${a}\n\n${HELP}`);
         out.dir = a;
     }
@@ -102,9 +127,23 @@ async function main() {
   const config = loadConfig({
     ...(args.host ? { ollamaHost: normalizeHost(args.host) } : {}),
     ...(args.yes ? { autoApprove: true } : {}),
+    ...(args.groq ? { groqCoding: true } : {}),
   });
-  const client = new OllamaClient(config.ollamaHost);
-  const session = new Session({ client, config, cwd });
+  if (!config.groqApiKey) config.groqApiKey = savedUserEnv('GROQ_API_KEY');
+  if (!process.env.LOCALLOOM_GROQ_CODING && savedUserEnv('LOCALLOOM_GROQ_CODING') === '1') config.groqCoding = true;
+  if (args.groqModel) config.groqModel = args.groqModel.replace(/^groq\//, '');
+  if (config.groqCoding && !config.groqApiKey) fail('--groq needs a Groq API key: set the GROQ_API_KEY environment variable first.');
+  const client = new MultiClient(
+    new OllamaClient(config.ollamaHost),
+    config.groqApiKey ? new GroqClient({ apiKey: config.groqApiKey }) : undefined,
+  );
+  const projectsRoot = args.here ? undefined : path.resolve(process.env.LOCALLOOM_PROJECTS_DIR || path.join(cwd, PROJECTS_DIR_NAME));
+  let session: Session;
+  try {
+    session = new Session({ client, config, cwd, projectsRoot });
+  } catch (err) {
+    fail(`Could not create the projects folder (${projectsRoot}): ${(err as Error).message}`);
+  }
 
   if (args.model) {
     try {
