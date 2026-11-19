@@ -20,6 +20,14 @@ Every conversation is saved automatically on your machine, so you can come back 
 
 Chats are stored only locally, one JSON file per chat, in `~/.localloom/sessions` (on Windows `C:\Users\<you>\.localloom\sessions`). Nothing is uploaded. Set `LOCALLOOM_HISTORY_DIR` to keep them somewhere else, or `LOCALLOOM_NO_HISTORY=1` to not save chats at all. `/clear` starts a new chat; the cleared one stays in the history.
 
+### Undo
+
+`/undo` reverts every file change made by the last request: edited files get their earlier content back, files the agents created are removed and files they deleted come back. Changes made by commands (for example a generated file) are reverted too. Type `/undo` again to go further back (up to 20 requests). If the undone request created the project folder and nothing else is left in it, the folder is removed as well.
+
+Before each request LocalLoom copies the project folder into memory; afterwards it keeps only what changed. Folders such as `node_modules`, `.git`, `dist`, `build` and virtualenvs are never copied, so changes inside them (e.g. from `npm install`) are not undone. A folder with more than 5000 files or 64 MB is too large to copy; then `/undo` reverts only the changes made by the file tools, and LocalLoom says so.
+
+If you edited a file after the request, `/undo` stops and lists it instead of discarding your edit; `/undo force` reverts anyway. Undo checkpoints live in memory: they are lost when you exit, resume another chat with `/session` or start a new one with `/clear`.
+
 ### Coding on Groq (optional)
 
 Local models on a laptop GPU are slow at writing code. You can hand just the coding to [Groq](https://groq.com) while everything else stays local:
@@ -35,6 +43,7 @@ Note that the code the Coder reads and writes is sent to Groq. Without `--groq` 
 
 ## Features
 
+- **Undo**: `/undo` reverts the file changes of the last request, including changes made by commands.
 - **Local chat history**: every chat is saved on your machine and can be resumed with `/session`.
 - **Polished TUI** (React + Ink): streaming responses, live agent activity bar, tool execution feedback, model/mode indicators, command palette with completion, keyboard navigation.
 - **Local model selection**: auto-detects installed Ollama models. `/models` opens an interactive picker where you can assign a model to all agents or to each agent separately. You can switch models without restarting.
@@ -105,6 +114,7 @@ localloom [options] [directory]
 | `/auto` | Enable Auto mode (SLM routing) |
 | `/manual [name]` | Enable Manual mode |
 | `/groq [model]` | Toggle running the Coder and Fixer on Groq, or pick the Groq model |
+| `/undo [force]` | Revert the file changes made by the last request (repeat to go further back) |
 | `/new` | Start a new project folder with the next request |
 | `/session [n\|id]` | Browse saved chats and resume one (aliases `/sessions`, `/history`, `/resume`) |
 | `/agents` | Show agents, their models, tools and status |
