@@ -303,6 +303,48 @@ export function App({ session, initialPrompt, history }: { session: Session; ini
           rerender();
           return;
         }
+        case '/undo': {
+          if (busyRef.current) {
+            notice('warn', 'Agents are still working. Press esc to cancel the current task before undoing.');
+            return;
+          }
+          const force = /^(--)?force$/i.test(args);
+          if (args && !force) {
+            notice('error', `Unknown option "${args}". Use /undo, or /undo force to overwrite files you changed afterwards.`);
+            return;
+          }
+          const list = (files: string[]) => (files.length > 6 ? `${files.slice(0, 6).join(', ')} and ${files.length - 6} more` : files.join(', '));
+          const quote = (task: string) => `“${task.length > 60 ? `${task.slice(0, 59)}…` : task}”`;
+          let result;
+          try {
+            result = session.undo({ force });
+          } catch (err) {
+            notice('error', `Undo failed: ${(err as Error).message}`);
+            return;
+          }
+          if (result.status === 'nothing') {
+            notice('info', 'Nothing to undo: no request in this chat has changed files yet (or every change was already undone).');
+            return;
+          }
+          if (result.status === 'conflict') {
+            notice(
+              'warn',
+              `Not undone: ${list(result.conflicts)} changed after ${quote(result.task)}. Undoing would discard those edits — type /undo force to do it anyway.`,
+            );
+            return;
+          }
+          const parts = [
+            result.restored.length && `restored ${list(result.restored)}`,
+            result.deleted.length && `removed ${list(result.deleted)}`,
+          ].filter(Boolean);
+          notice('success', `Undid ${quote(result.task)} — ${parts.join('; ') || 'only empty folders were removed'}.`);
+          if (result.removedProject) notice('info', 'Its project folder was empty afterwards and has been removed; your next request will start a new project.');
+          if (result.failed.length) notice('error', `Could not revert ${list(result.failed)} (in use or not writable).`);
+          if (!result.complete) notice('warn', 'That folder was too large to snapshot, so changes made by commands were not reverted.');
+          if (result.remaining) notice('info', `${result.remaining} earlier request${result.remaining === 1 ? '' : 's'} can still be undone.`);
+          rerender();
+          return;
+        }
         case '/new':
           if (!session.projectsRoot) {
             notice('info', 'Started with --here: LocalLoom works directly in this directory, so there are no project folders.');
