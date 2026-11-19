@@ -102,6 +102,11 @@ export class Workspace {
     return fs.existsSync(abs);
   }
 
+  /** Original content (null: did not exist) of every file the file tools touched in this task. */
+  originalEntries(): [string, string | null][] {
+    return [...this.originals];
+  }
+
   /** Start tracking a new task's changes. */
   resetChanges(): void {
     this.originals.clear();

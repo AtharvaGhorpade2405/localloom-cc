@@ -10,6 +10,7 @@ export const COMMANDS: CommandInfo[] = [
   { name: '/auto', description: 'Enable Auto mode — a local SLM routes models to agents' },
   { name: '/groq', args: '[model]', description: 'Toggle running the Coder and Fixer on Groq (Auto mode), or pick the Groq model' },
   { name: '/manual', args: '[model]', description: 'Enable Manual mode — you choose the model' },
+  { name: '/undo', args: '[force]', description: 'Revert the file changes made by the last request (repeat to go further back)' },
   { name: '/new', description: 'Start a new project folder with your next request' },
   { name: '/session', args: '[n|id]', description: 'Browse saved chats and resume one (stored locally)', aliases: ['/sessions', '/history', '/resume'] },
   { name: '/agents', description: 'Show agent roles, assigned models and status' },

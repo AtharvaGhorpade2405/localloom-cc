@@ -13,7 +13,16 @@ import { listDir } from '../tools/fsTools.js';
 import { ApprovalPolicy, type ApprovalDecision, type ApprovalRequest, type ToolContext } from '../tools/registry.js';
 import { formatReport, verifyChanges } from '../tools/verify.js';
 import { Workspace } from '../tools/workspace.js';
+import { buildCheckpoint, captureBaseline, undoCheckpoint, type Baseline, type Checkpoint, type UndoOutcome } from './checkpoints.js';
 import { createProjectDir, looksLikeNewProject, projectNameFor, removeIfEmpty } from './projects.js';
+
+/** How many requests back /undo can go. */
+export const MAX_CHECKPOINTS = 20;
+
+export type UndoResult =
+  | { status: 'nothing' }
+  | { status: 'conflict'; task: string; conflicts: string[] }
+  | ({ status: 'done'; task: string; complete: boolean; removedProject: boolean; remaining: number } & UndoOutcome);
 
 export type Mode = 'auto' | 'manual';
 
@@ -144,6 +153,8 @@ export class Session {
   manual: Partial<Assignment> = {};
   lastRouting?: RoutingResult;
   private memory: MemoryEntry[] = [];
+  /** One per request that changed files, newest last, with the memory entry it produced. */
+  private checkpoints: { checkpoint: Checkpoint; entry?: MemoryEntry }[] = [];
 
   constructor(deps: SessionDeps) {
     this.client = deps.client;
@@ -275,6 +286,51 @@ export class Session {
 
   clearMemory(): void {
     this.memory = [];
+    this.checkpoints = [];
+  }
+
+  /** How many requests /undo can revert, newest first. */
+  get undoable(): string[] {
+    return this.checkpoints.map((c) => c.checkpoint.task).reverse();
+  }
+
+  /**
+   * Revert the file changes of the most recent request that made any. Refuses (status "conflict")
+   * when those files were changed afterwards, unless `force` is set.
+   */
+  undo(opts: { force?: boolean } = {}): UndoResult {
+    const last = this.checkpoints.at(-1);
+    if (!last) return { status: 'nothing' };
+    const cp = last.checkpoint;
+    const outcome = undoCheckpoint(cp, opts);
+    if (!outcome.applied) return { status: 'conflict', task: cp.task, conflicts: outcome.conflicts };
+    this.checkpoints.pop();
+    if (last.entry && this.memory.includes(last.entry)) {
+      last.entry.outcome = 'Undone by the user with /undo: every file change from this request was reverted.';
+    }
+    let removedProject = false;
+    if (cp.projectDir && this.projectsRoot && removeIfEmpty(cp.projectDir)) {
+      removedProject = true;
+      if (this.project?.dir === cp.projectDir) {
+        this.project = undefined;
+        this.workspace = new Workspace(this.projectsRoot);
+      }
+    }
+    return { status: 'done', task: cp.task, complete: cp.complete, removedProject, remaining: this.checkpoints.length, ...outcome };
+  }
+
+  private recordCheckpoint(baseline: Baseline | undefined, task: string, memoryBefore: number, createdProject: boolean): void {
+    if (!baseline) return;
+    let checkpoint: Checkpoint | undefined;
+    try {
+      checkpoint = buildCheckpoint(baseline, this.workspace.originalEntries(), task);
+    } catch {
+      return;
+    }
+    if (!checkpoint) return;
+    if (createdProject && this.project && this.project.dir === baseline.root) checkpoint.projectDir = baseline.root;
+    this.checkpoints.push({ checkpoint, entry: this.memory.length > memoryBefore ? this.memory.at(-1) : undefined });
+    if (this.checkpoints.length > MAX_CHECKPOINTS) this.checkpoints.shift();
   }
 
   get memorySize(): number {
@@ -295,6 +351,7 @@ export class Session {
    */
   restore(snap: SessionSnapshot): string | undefined {
     this.memory = Array.isArray(snap.memory) ? snap.memory.map((m) => ({ request: String(m.request), outcome: String(m.outcome) })) : [];
+    this.checkpoints = [];
     this.startFresh = false;
     if (!this.projectsRoot) {
       // --here: the agents always work in the start directory.
@@ -365,6 +422,35 @@ export class Session {
       emit({ type: 'task:end', status: 'error', summary: message, changedFiles: [] });
       return;
     }
+    // Snapshot the folder so /undo can revert this request, including changes made by commands.
+    let baseline: Baseline | undefined;
+    try {
+      baseline = captureBaseline(this.workspace.root);
+      if (!baseline.complete) {
+        emit({
+          type: 'notice',
+          level: 'warn',
+          text: 'This folder is too large to snapshot, so /undo will only revert files changed by the file tools (not by commands).',
+        });
+      }
+    } catch {
+      baseline = undefined;
+    }
+    const memoryBefore = this.memory.length;
+    try {
+      await this.runPipeline(task, emit, requestApproval, signal, createdProject);
+    } finally {
+      this.recordCheckpoint(baseline, task, memoryBefore, createdProject);
+    }
+  }
+
+  private async runPipeline(
+    task: string,
+    emit: EmitFn,
+    requestApproval: (req: ApprovalRequest) => Promise<ApprovalDecision>,
+    signal: AbortSignal | undefined,
+    createdProject: boolean,
+  ): Promise<void> {
     this.workspace.resetChanges();
     const toolContext: ToolContext = {
       workspace: this.workspace,
